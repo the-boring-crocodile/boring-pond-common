@@ -1,0 +1,18 @@
+version = 1
+
+# The last matching annotation wins.
+
+[[annotations]]
+path = ["**"]
+SPDX-FileCopyrightText = "2026 Wald and the boring-pond-common contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ["**/*.md", "docs/**"]
+SPDX-FileCopyrightText = "2026 Wald and the boring-pond-common contributors"
+SPDX-License-Identifier = "CC-BY-SA-4.0"
+
+[[annotations]]
+path = ["packages/boring-deploy/src/boring_deploy/python_notices/**"]
+SPDX-FileCopyrightText = "the authors named in each notice"
+SPDX-License-Identifier = "LicenseRef-Third-Party-Notices"

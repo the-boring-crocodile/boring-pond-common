@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boring-file-core"
+version = "0.7.5"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "COPYING.md"]
+description = "File reading, patching and text-format primitives for the Pond"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+boring_file_core = ["py.typed"]

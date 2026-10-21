@@ -1,0 +1,3 @@
+python/licenses/ of cpython-3.14.8+20261001-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst
+from https://github.com/astral-sh/python-build-standalone/releases/download/20261001/cpython-3.14.8+20261001-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst
+sha256 0f5cfcf664aa406ee958625ed5b29b1bfc76d553e8ad1304f48fec39b74e0554

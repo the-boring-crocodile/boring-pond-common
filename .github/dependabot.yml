@@ -1,0 +1,12 @@
+# Pinned actions (by commit) stay current through monthly, grouped pull
+# requests that pass the same check as any other change. Python dependencies
+# are hash-locked by scripts/lock.py and relocked with a release, not here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

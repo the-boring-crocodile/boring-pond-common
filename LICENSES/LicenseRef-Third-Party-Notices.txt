@@ -1,0 +1,5 @@
+Third-party licence notices
+
+These files are the licence texts of third-party software, kept so that they
+ship with it as those licences require. Each applies to the software it
+names; none of them is a licence of this repository's own work.

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boring-service-kit"
+version = "0.7.5"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "COPYING.md"]
+description = "What every boring MCP service shares: tool conventions and the service side of the Pond's service contract"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.2.0,<2.3",
+    "httpx2>=2.13,<3",
+    "starlette>=1.6,<2",
+    "uvicorn>=0.54,<1",
+    "boring-registry>=0.7.5,<0.8",
+]
+
+[project.scripts]
+boring-service-keys = "boring_service_kit.keys:main"
+boring-service-oauth = "boring_service_kit.issuer.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+process = ["pywin32>=311; sys_platform == 'win32'"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+boring_service_kit = ["py.typed"]

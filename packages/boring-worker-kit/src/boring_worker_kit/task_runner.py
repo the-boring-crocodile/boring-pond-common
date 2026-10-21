@@ -92,7 +92,7 @@ async def serve(settings) -> None:
         # waited for at most RECEIPT_SECONDS, then the runner ends anyway.
         try:
             await asyncio.wait_for(abandoned, RECEIPT_SECONDS)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):  # one class only from Python 3.11
             pass
     except (ConnectionError, asyncio.IncompleteReadError):
         pass

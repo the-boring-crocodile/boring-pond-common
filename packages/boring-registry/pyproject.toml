@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-registry"
-version = "0.7.5"
+version = "0.7.6"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "Registration records shared by the Pond's MCP server, Pirates and services"

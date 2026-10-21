@@ -241,6 +241,7 @@ def test_after_uninstall_another_home_may_be_chosen(env):
     assert json.loads(boring_deploy.HOMES.read_text())["thing"] == str(home / "moved")
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 def test_release_with_install_steps_carries_uninstall(env, tmp_path):
     steps = tmp_path / "install_steps.py"
     steps.write_text("from boring_install import Setting\nSETTINGS = [Setting('config-dir', 'a directory',"

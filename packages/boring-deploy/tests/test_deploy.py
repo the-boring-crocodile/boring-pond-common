@@ -532,6 +532,7 @@ def test_the_launcher_under_a_real_python_3_10(env):
     assert result.stderr == "python3 3.11 or newer is needed to run this; this is python3 3.10\n"
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 def test_artifact_is_reproducible_and_launcher_runs(env):
     tmp, _ = env
     first, second = build(tmp, "1.0.0"), build(tmp, "1.0.0")

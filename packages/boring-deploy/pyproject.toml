@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-deploy"
-version = "0.7.5"
+version = "0.7.6"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "The deploy engine of the Pond family: one release of one component into its HOME"

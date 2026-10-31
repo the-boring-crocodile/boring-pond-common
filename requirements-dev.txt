@@ -1,0 +1,2 @@
+# Development-only tools; never part of a Common package.
+pytest==9.1.1

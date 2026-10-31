@@ -47,7 +47,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:  # in the package
     from . import Context, Failure, Release, homes, homes_update, installed_version, operation_lock, record
@@ -212,18 +212,15 @@ def _mount_points() -> set[str]:
 
 
 def seal(ctx: Context, folders: Iterable[Path], uid: int) -> None:
-    """Before userdel frees `uid`: each kept top-level folder the account owns
-    becomes root:root 0700, so a later account given the same number cannot
-    reach what is inside (which keeps its owner). Call it right before userdel
-    and do not delete the account when it raises.
+    """seal_folders for an install step's uninstall, logging to the deploy."""
+    seal_folders(folders, uid, ctx.log)
 
-    All folders are checked first: a symlink, something not a folder, a mount
-    point or a folder of another account stops it before any change. Then each
-    is opened without following a symlink, checked to be the one looked at, and
-    changed through that descriptor: mode first, then owner (a stop between
-    leaves it the account's, and a rerun seals it). A folder that is gone, or
-    root's already (sealed by an earlier run, or never the account's), is left
-    as it is."""
+
+def seal_check(folders: Iterable[Path], uid: int) -> list[tuple[Path, os.stat_result]]:
+    """The checks of seal_folders, without any change: raises Failure for a
+    symlink, something not a folder, a mount point or a folder of another
+    account. Returns the folders still to seal (gone and root's ones are left
+    out). An uninstall that plans before it acts calls this in its preflight."""
     mounts, todo = _mount_points(), []
     for folder in folders:
         try:
@@ -244,7 +241,22 @@ def seal(ctx: Context, folders: Iterable[Path], uid: int) -> None:
             raise Failure(f"{folder} belongs to uid {info.st_uid}, not the account's ({uid}): not sealed, "
                           "the account is kept")
         todo.append((folder, info))
-    for folder, info in todo:
+    return todo
+
+
+def seal_folders(folders: Iterable[Path], uid: int, log: Callable[[str], None]) -> None:
+    """Before userdel frees `uid`: each kept top-level folder the account owns
+    becomes root:root 0700, so a later account given the same number cannot
+    reach what is inside (which keeps its owner). Call it right before userdel
+    and do not delete the account when it raises Failure.
+
+    All folders are checked first (seal_check): nothing changes when one is
+    refused. Then each is opened without following a symlink, checked to be
+    the one looked at, and changed through that descriptor: mode first, then
+    owner (a stop between leaves it the account's, and a rerun seals it). A
+    folder that is gone, or root's already (sealed by an earlier run, or never
+    the account's), is left as it is."""
+    for folder, info in seal_check(folders, uid):
         fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             opened = os.fstat(fd)
@@ -254,7 +266,7 @@ def seal(ctx: Context, folders: Iterable[Path], uid: int) -> None:
             os.fchown(fd, *SEAL_OWNER)
         finally:
             os.close(fd)
-        ctx.log(f"sealed {folder}: root's, 0700 (inside, files keep uid {uid})")
+        log(f"sealed {folder}: root's, 0700 (inside, files keep uid {uid})")
 
 
 def report(ctx: Context, look: Look) -> None:

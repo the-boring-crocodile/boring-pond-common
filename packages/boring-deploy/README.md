@@ -1,10 +1,17 @@
 # boring-deploy
 
-How every Pond component is installed, updated, rolled back and uninstalled.
-One engine (standard library only) for all of them: a component's release
-artifact carries a copy of it plus the component's own steps. This page is
-the one place that explains it; components document only their own settings
-and checks.
+The shared Linux deployment engine for Crocodile, Pirates and Services.
+Each release carries this engine plus its component's own installation and
+health checks. The common sequence gives an operator the same way to inspect,
+switch and recover releases across components; component guides own their
+settings and the work a restart interrupts. Windows pondNT has its own
+[installer](https://github.com/the-boring-crocodile/boring-pondnt/blob/main/docs/INSTALL.md).
+
+Start with [Using a release](#using-a-release). For an interrupted update, read
+[What a deploy does](#what-a-deploy-does) and [Rollback](#rollback);
+[First install and uninstall](#first-install-and-uninstall) explains retained
+data. [Building a release](#building-a-release-for-component-authors) is for
+component authors.
 
 ## Using a release
 
@@ -37,6 +44,9 @@ is made readable for the component's own accounts (directories and
 executables 0755, other files 0644) whatever modes the unpacked files have.
 
 ### What a deploy does
+
+The diagram follows a running installation through a successful update.
+A stopped installation skips start and smoke, as described below.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/deploy-update-dark.svg">
@@ -78,6 +88,24 @@ nothing runs, the deploy says `site is stopped: not started`, skips start and
 smoke, and records the release as installed, not started. A first install
 starts what it made (its units, its stack).
 
+A Docker stack can hold more than the component: a front end beside backends
+it does not build (the services' MCP ferry and its ha-mcp, say). The steps'
+`units(ctx)` then names the compose services this deploy owns; whether the
+installation runs, `compose up -d` and the wait ask about those services only
+(Compose still starts their `depends_on`). The other services are the
+operator's: started, updated and watched with `docker compose` directly. A
+step module without `units` (every Docker component so far) gets the whole
+stack, as before.
+
+Before the switch writes anything, the deploy refuses a name that is not a
+service of the stack (`docker compose config --services`), and an unnamed
+service that also uses `${BORING_IMAGE}`: it would keep running the old image
+while `.env` names the new one. The wait covers the named services only, not
+the `depends_on` Compose starts with them; a front end that needs a healthy
+backend says so with `condition: service_healthy`, which `up -d` honours.
+A rollback to a release whose engine is older than 0.7.8 ignores `units` and
+brings up the whole stack.
+
 ### One operation at a time
 
 A deploy or uninstall of a HOME holds that HOME's operation lock
@@ -104,6 +132,13 @@ Pirates' own operation lock is held: that is the same order. A lock that is
 held refuses at once (except `homes.lock`, which waits); there is no retry.
 
 ### Rollback
+
+Rollback changes the software being run. It does not undo work that an agent or
+service already performed, and it does not restore data automatically. If a
+new release changed the data format, the older release may refuse it: restore
+the compatible backup through the component's recovery procedure before trying
+that older software. A retained release and a data backup solve different parts
+of recovery.
 
 Rollback is the previous release's own deploy: `sudo HOME/previous/deploy`
 (container components: `HOME/release.previous/deploy`). Nothing is rolled back
@@ -160,7 +195,7 @@ what is inside them, and not a Pirate's home.
 
 A component's `scripts/build.py` calls `boring_deploy.artifact.assemble(out,
 release, steps, files, install=None)`. `steps` is a module with optional
-functions: `check(ctx)`, `smoke(ctx)`, `units(ctx)` (venv), `healthy(ctx)`,
+functions: `check(ctx)`, `smoke(ctx)`, `units(ctx)` (systemd units or Compose services), `healthy(ctx)`,
 `data_generation(ctx)`, `backup(ctx, directory)`. `install` is a module with
 `look(ctx)`, `SETTINGS`, `ready`, `plan`, `install` and `uninstall`
 (`boring_deploy.install` documents each). The engine's docstring

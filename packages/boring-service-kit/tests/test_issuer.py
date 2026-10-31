@@ -72,7 +72,7 @@ def pkce():
     return verifier, challenge
 
 
-async def sign_in(service, client_id=CLAUDE, redirect=CALLBACK, secret=SECRET, client_secret=None):
+async def sign_in(service, client_id=CLAUDE, redirect=CALLBACK, secret=SECRET, client_secret=None, headers=None):
     verifier, challenge = pkce()
     response = await service.client.get("/authorize", params={
         "response_type": "code", "client_id": client_id, "redirect_uri": redirect, "code_challenge": challenge,
@@ -91,7 +91,7 @@ async def sign_in(service, client_id=CLAUDE, redirect=CALLBACK, secret=SECRET, c
             "code_verifier": verifier, "resource": URL}
     if client_secret:
         form["client_secret"] = client_secret
-    token = await service.client.post("/token", data=form)
+    token = await service.client.post("/token", data=form, headers=headers)
     return page.text, answer, token
 
 
@@ -494,6 +494,12 @@ def test_issuer_under_a_path_behind_a_path_keeping_proxy(tmp_path):
         called = await service.client.post("/services/lone/mcp", json=body,
                                            headers=mcp_headers("tools/call", "whoami", tokens["access_token"]))
         assert called.status_code == 200 and "robin" in called.json()["result"]["content"][0]["text"]
+        revoked = await service.client.post("/services/lone/revoke", data={
+            "client_id": CLAUDE, "token": tokens["refresh_token"]})
+        assert revoked.status_code == 200, revoked.text
+        refused = await service.client.post("/services/lone/mcp", json=body,
+            headers=mcp_headers("tools/call", "whoami", tokens["access_token"]))
+        assert refused.status_code == 401
 
     async def go():
         async with Service(config.app(server_for(config)), url) as service:

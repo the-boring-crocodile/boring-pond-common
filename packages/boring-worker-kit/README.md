@@ -1,6 +1,13 @@
 # boring-worker-kit
 
 Canonical Linux worker operations, maintained in boring-pond-common.
+
+`file_refs.prepare_call(files, arguments, save_to=None)` admits a service call's file work
+without reading files. It checks marker shapes/counts and configured read/write scope through
+`FileTools.prepare`; a batch owner calls it before executing any step. Actual file existence,
+contents, byte limits and current hashes are checked by `call_service`/`resolve` at execution,
+so earlier steps may create or update referenced files and save targets. One traversal owns
+reference discovery, admission and resolution. Direct service calls also use this boundary.
 MCP and boring-pirates depend on the same wheel. The MCP module names remain
 compatibility imports for callers/tests; they contain no second implementation.
 
@@ -36,5 +43,5 @@ No OAuth server/agent approvals, service grants database, provider loop or site
 installer belongs here. Windows callers continue to use file-core/service-kit;
 this Linux worker package is not introduced into pondNT.
 
-Its tests live with the Crocodile and the Pirates, which use it. Install
+Its tests are in tests/ here; consumers test only their own use of it. Install
 Common's wheels from one release together, never mixed with older ones.

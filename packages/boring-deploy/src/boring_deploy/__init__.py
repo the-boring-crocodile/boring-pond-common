@@ -22,7 +22,8 @@ refuses). Steps, stopping at the first failure:
   4. switch    venv: previous <- current, current <- new, restart the units
                that run (a stopped unit stays stopped);
                docker: .env BORING_IMAGE <- new image, compose up -d (an
-               update leaves a stopped stack stopped; a first install starts it)
+               update leaves a stopped stack stopped; a first install starts it;
+               only the compose services units(ctx) names, else the whole stack)
   5. start     wait until running (nothing to wait for when all were stopped)
   6. smoke     the component's own end-to-end check (skipped when stopped)
   7. record    append to HOME/DEPLOYED, print the rollback command
@@ -37,7 +38,8 @@ HOME/release.previous/deploy (docker).
 
 The component supplies `steps`, a module with optional functions
 check(ctx), smoke(ctx), units(ctx) -> [unit, ...] (venv: the units an update
-restarts when they run), healthy(ctx) -> bool | None (the running release
+restarts when they run; docker: the compose services the deploy owns, started
+and waited for, the whole stack when none are named), healthy(ctx) -> bool | None (the running release
 passes its own checks, asked before the switch; a healthy one always becomes
 previous), data_generation(ctx) -> int | None, backup(ctx, directory) -> Path,
 lock(ctx) -> a context manager held from step 1 to the record (a component's
@@ -117,6 +119,9 @@ class Context:
     restarted: list[str] = field(default_factory=list)  # units the switch restarted (they ran, or start)
     stopped: list[str] = field(default_factory=list)    # what was stopped and stays stopped (units, a stack)
     not_started: bool = False     # the switch left the component stopped: no start, no smoke
+    # What a step changed on the host before the switch (the steps' own words),
+    # so a failure before the switch is not reported as "nothing changed".
+    changed: list[str] = field(default_factory=list)
 
     def run(self, *command: str, user: str | None = None, check: bool = True,
             capture: bool = True, env: dict[str, str] | None = None,
@@ -401,7 +406,18 @@ def install_app(ctx: Context, target: Path) -> None:
 
 class Docker:
     """HOME/compose.yaml (the operator's, image: ${BORING_IMAGE}), HOME/.env,
-    HOME/release/ and HOME/release.previous/."""
+    HOME/release/ and HOME/release.previous/.
+
+    `units` are compose service names: the part of the stack this component's
+    deploy owns (a front end beside backends it does not build, say). Whether it
+    runs, `up -d` and the wait apply to those services only (with their
+    `depends_on`, as Compose starts them); other services are the operator's,
+    neither started nor waited for. No units: the whole stack, as before.
+    check_units refuses, before the switch, a name that is not a service of the
+    stack and an unnamed service that uses ${BORING_IMAGE} (it would keep the old
+    image while .env names the new one). The wait covers the named services
+    only, not their `depends_on`."""
+    MARKER = "boring-deploy-marker:units"  # stands for ${BORING_IMAGE} when the stack is rendered
     PREVIOUS = "release.previous"
     START = "start it with docker compose -f HOME/compose.yaml up -d"
 
@@ -432,21 +448,41 @@ class Docker:
         env = {"BORING_IMAGE": image} if image else None
         return ctx.run("docker", "compose", "-f", str(ctx.home / "compose.yaml"), *args, env=env, **kw)
 
-    def ps(self, ctx: Context, check: bool = False) -> list[dict[str, Any]]:
-        """The stack's containers, running or not (`compose ps --all --format
-        json`: one object per line, or one array in older Compose releases)."""
-        text = self.compose(ctx, "ps", "--all", "--format", "json", check=check).stdout.strip()
+    def check_units(self, ctx: Context, units: list[str]) -> None:
+        """Step 4, before the switch writes anything: the named services exist,
+        and every service that uses ${BORING_IMAGE} is among them."""
+        if not units:
+            return
+        known = self.compose(ctx, "config", "--services", image=self.MARKER).stdout.split()
+        unknown = [u for u in units if u not in known]
+        if unknown:
+            raise Failure(f"units names no service of {ctx.home / 'compose.yaml'}: {', '.join(unknown)}",
+                          f"its services: {', '.join(known) or 'none'}")
+        rendered = json.loads(self.compose(ctx, "config", "--format", "json", image=self.MARKER).stdout)
+        sharing = sorted(name for name, service in rendered.get("services", {}).items()
+                         if isinstance(service, dict) and service.get("image") == self.MARKER and name not in units)
+        if sharing:
+            raise Failure(f"{', '.join(sharing)} also use ${{BORING_IMAGE}} but the deploy starts only "
+                          f"{', '.join(units)}: they would keep the old image while .env names the new one",
+                          "name them in the component's units, or give them an image of their own")
+
+    def ps(self, ctx: Context, check: bool = False, services: tuple[str, ...] | list[str] = ()) -> list[dict[str, Any]]:
+        """The containers of `services` (all: the stack), running or not
+        (`compose ps --all --format json`: one object per line, or one array in
+        older Compose releases)."""
+        text = self.compose(ctx, "ps", "--all", "--format", "json", *services, check=check).stdout.strip()
         if text.startswith("["):
             return [r for r in json.loads(text) if isinstance(r, dict)]
         return [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
 
-    def running(self, ctx: Context) -> bool:
+    def running(self, ctx: Context, services: tuple[str, ...] | list[str] = ()) -> bool:
         """Whether the stack runs: a container running or restarting (meant to
         run). None, or only exited/created ones: it is stopped (`compose stop`,
         `compose down`). The family's stacks use `restart: unless-stopped`, so a
         crashed container is restarting, not exited: exited means an operator
-        stopped it. A failing `compose ps` is a failure, never a guess."""
-        return any(r.get("State") in ("running", "restarting") for r in self.ps(ctx, check=True))
+        stopped it. A failing `compose ps` is a failure, never a guess.
+        With `services`, only theirs count."""
+        return any(r.get("State") in ("running", "restarting") for r in self.ps(ctx, check=True, services=services))
 
     def switch(self, ctx: Context, units: list[str]) -> None:
         """The new image goes into .env either way. An update leaves a stopped
@@ -455,7 +491,7 @@ class Docker:
         installed) starts it. Decided before anything changes."""
         home = ctx.home
         assert ctx.new is not None and ctx.image is not None
-        ctx.not_started = ctx.installed is not None and not self.running(ctx)
+        ctx.not_started = ctx.installed is not None and not self.running(ctx, units)
         write_env(home / ".env", "BORING_IMAGE", ctx.image)
         if (home / "release").exists():
             if worth_keeping(home, home / "release", ctx.running_healthy):
@@ -466,9 +502,11 @@ class Docker:
         ctx.new.rename(home / "release")
         ctx.new = home / "release"
         if ctx.not_started:
-            ctx.stopped = [f"the compose stack {home / 'compose.yaml'}"]
+            ctx.stopped = [f"the compose stack {home / 'compose.yaml'}"
+                           + (f" ({', '.join(units)})" if units else "")]
         else:
-            self.compose(ctx, "up", "-d")
+            self.compose(ctx, "up", "-d", *units)
+            ctx.restarted = list(units)  # what the wait asks about (none: the whole stack)
         self.prune(ctx)
 
     def prune(self, ctx: Context) -> None:
@@ -485,7 +523,7 @@ class Docker:
     def wait(self, ctx: Context, units: list[str]) -> None:
         deadline = time.monotonic() + WAIT_SECONDS
         while True:
-            rows = self.ps(ctx)
+            rows = self.ps(ctx, services=units)
             bad = [r for r in rows if r.get("State") != "running" or r.get("Health") not in ("", "healthy")]
             if rows and not bad:
                 return
@@ -703,6 +741,8 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
             step = "switch"
             print("4 switch")
             units = hook("units", default=[])
+            if hasattr(runtime, "check_units"):
+                runtime.check_units(ctx, units)  # before anything that runs changes
             switched = True
             runtime.switch(ctx, units)
             step = "start"
@@ -736,6 +776,11 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
         if ctx.installing and not switched:
             print("  the first install changed the host but no release runs yet: run the deploy again"
                   " (it reuses what is there)", file=sys.stderr)
+        elif not switched and ctx.changed:
+            print("  the installed release is untouched, but the host changed before the switch:",
+                  file=sys.stderr)
+            for line in ctx.changed:
+                print(f"    {line}", file=sys.stderr)
         elif not switched:
             print("  nothing changed: the installed release is untouched", file=sys.stderr)
         elif hint := rollback_hint(runtime, home, release.version):

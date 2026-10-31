@@ -24,6 +24,9 @@ case "$(basename "$0") $1" in
   "systemctl restart") shift; for unit in "$@"; do rm -f "$FAKE_STATE.$unit"; done ;;
   "docker compose") case "$*" in
       *" ps "*) cat "$FAKE_STATE.compose" 2>/dev/null || echo '{"Service":"svc","State":"running","Health":""}' ;;
+      *" config --services"*) cat "$FAKE_STATE.services" 2>/dev/null || echo svc ;;
+      *" config --format json"*) sed "s|IMAGE|$BORING_IMAGE|g" "$FAKE_STATE.config" 2>/dev/null \\
+          || echo "{\\"services\\": {\\"svc\\": {\\"image\\": \\"$BORING_IMAGE\\"}}}" ;;
       *" up "*) rm -f "$FAKE_STATE.compose" ;;
     esac ;;
   "docker image") [ "$2" = ls ] && [ -n "$FAKE_TAGS" ] && printf '%s\\n' $FAKE_TAGS ;;
@@ -59,11 +62,14 @@ def env(tmp_path, monkeypatch):
 
 
 class Steps:
-    def __init__(self, generation=None):
-        self.generation, self.calls = generation, []
+    def __init__(self, generation=None, units=None):
+        self.generation, self.calls, self._units = generation, [], units
 
     def units(self, ctx):
-        return ["thing.service"]
+        """venv: the unit; docker: the whole stack unless a test names services."""
+        if self._units is not None:
+            return list(self._units)
+        return ["thing.service"] if ctx.release.runtime == "venv" else []
 
     def check(self, ctx):
         self.calls.append("check")
@@ -427,6 +433,59 @@ def test_a_running_docker_stack_is_updated_and_a_first_install_starts(env):
     assert [c for c in calls(tmp)[seen:] if c.endswith(" up -d")] and steps.calls == ["check", "smoke"] * 2
 
 
+def test_docker_units_name_the_services_the_deploy_owns(env):
+    """A stack with a front end and backends it does not build: units name the
+    front end; whether it runs, `up -d` and the wait ask about it alone."""
+    tmp, home = env
+    (home / "compose.yaml").write_text(
+        "services:\n  svc:\n    image: ${BORING_IMAGE}\n  backend:\n    image: other:1\n")
+    (tmp / "state.compose").write_text("")
+    steps = Steps(units=["svc"])
+    code, out = deploy(build(tmp, "1.0.0", runtime="docker"), steps, str(home))
+    assert code == 0 and "1.0.0 is live" in out, out
+    log = calls(tmp)
+    assert any(c.endswith(" up -d svc") for c in log), log
+    assert not any(c.endswith(" up -d") for c in log)
+    assert any(c.endswith("ps --all --format json svc") for c in log)
+    assert not any(c.endswith("ps --all --format json") for c in log)
+
+
+def test_docker_units_refuse_unknown_names_before_the_switch(env):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    (tmp / "state.services").write_text("svc\nbackend\n")
+    code, out = deploy(build(tmp, "1.0.0", runtime="docker"), Steps(units=["front"]), str(home))
+    assert code == 1 and "units names no service" in out and "front" in out and "svc, backend" in out, out
+    assert not (home / ".env").exists() and not [c for c in calls(tmp) if " up " in f"{c} "]
+
+
+def test_docker_units_refuse_an_unnamed_service_with_the_image(env):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    (tmp / "state.services").write_text("svc\nworker\nbackend\n")
+    (tmp / "state.config").write_text(
+        '{"services": {"svc": {"image": "IMAGE"}, "worker": {"image": "IMAGE"}, "backend": {"image": "other:1"}}}')
+    code, out = deploy(build(tmp, "1.0.0", runtime="docker"), Steps(units=["svc"]), str(home))
+    assert code == 1 and "worker also use ${BORING_IMAGE}" in out and "backend" not in out.split("FAILED")[1], out
+    assert not (home / ".env").exists() and not [c for c in calls(tmp) if " up " in f"{c} "]
+    assert "nothing changed" in out
+
+
+def test_docker_units_stopped_front_end_stays_stopped(env):
+    """The named service exited (its backend may run): an update leaves it
+    stopped and says which services."""
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    steps = Steps(units=["svc"])
+    assert deploy(build(tmp, "1.0.0", runtime="docker"), steps, str(home))[0] == 0
+    (tmp / "state.compose").write_text(EXITED)
+    seen = len(calls(tmp))
+    code, out = deploy(build(tmp, "1.1.0", runtime="docker"), steps, str(home))
+    assert code == 0, out
+    assert "site is stopped: not started" in out and "(svc)" in out
+    assert not [c for c in calls(tmp)[seen:] if " up " in f"{c} "]
+
+
 def test_an_update_restarts_only_what_runs_and_what_an_install_made(env):
     tmp, home = env
 
@@ -446,6 +505,21 @@ def test_an_update_restarts_only_what_runs_and_what_an_install_made(env):
     assert "not started: b.service" in out and "systemctl is-active b.service" in calls(tmp)
     # waited for what was restarted only: b stays inactive and the deploy still succeeds
     assert "1.0.0 is live" in out
+
+
+def test_a_change_before_the_switch_is_reported_not_nothing_changed(env):
+    """A units hook that wrote host files and then failed: the engine names what
+    the step recorded in ctx.changed instead of "nothing changed"."""
+    tmp, home = env
+
+    class Partial(Steps):
+        def units(self, ctx):
+            ctx.changed.append("wrote a.service (backup in /tmp/b)")
+            raise boring_deploy.Failure("the second unit could not be written")
+    code, out = deploy(build(tmp, "1.0.0"), Partial(), str(home))
+    assert code == 1 and "the second unit could not be written" in out, out
+    assert "nothing changed" not in out
+    assert "host changed before the switch" in out and "wrote a.service (backup in /tmp/b)" in out
 
 
 def held_deploy(tmp, home, release, steps_class=Steps):

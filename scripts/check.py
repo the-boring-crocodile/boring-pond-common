@@ -5,7 +5,7 @@ against the built wheels in a fresh environment (not against the source tree).
     python scripts/check.py [--python /usr/bin/python3.12]
 
 Needs uv (PATH or $UV) and network access to the package index for third-party
-dependencies and pytest.
+dependencies and the test tools (requirements-dev.txt).
 """
 import argparse
 import os
@@ -33,7 +33,7 @@ def main():
         run(uv, "venv", "--quiet", "--python", args.python, venv)
         env = dict(os.environ, VIRTUAL_ENV=str(venv))
         wheels = sorted((tmp / "dist").glob("*.whl"))
-        run(uv, "pip", "install", "--quiet", "pytest", *wheels, env=env)
+        run(uv, "pip", "install", "--quiet", "-r", ROOT / "requirements-dev.txt", *wheels, env=env)
         python = venv / "bin" / "python"
         failed = []
         for name in PACKAGES:

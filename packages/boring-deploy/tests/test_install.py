@@ -447,7 +447,8 @@ def test_seal_refuses_before_any_change(sealing, tmp_path, monkeypatch, kind):
     good.mkdir(mode=0o750)
     os.chmod(good, 0o750)
     if kind == "symlink":
-        (tmp_path / "elsewhere").mkdir(mode=0o755)
+        (tmp_path / "elsewhere").mkdir()
+        os.chmod(tmp_path / "elsewhere", 0o755)  # not the umask's
         odd.symlink_to(tmp_path / "elsewhere")
     elif kind == "file":
         odd.write_text("")
@@ -473,6 +474,20 @@ def test_seal_refuses_a_mount_point_and_leaves_sealed_folders(sealing, tmp_path,
     installing.seal(sealing.ctx, [folder], 4242)  # a rerun: nothing to do, nothing refused
     assert sealing.owned == {}
 
+
+def test_seal_check_changes_nothing_and_names_what_is_left(sealing, tmp_path):
+    """The check an uninstall runs in its preflight, and seal_folders with a plain log."""
+    owned, gone = tmp_path / "owned", tmp_path / "gone"
+    owned.mkdir(mode=0o750)
+    os.chmod(owned, 0o750)
+    assert [folder for folder, _ in installing.seal_check([owned, gone], sealing.me)] == [owned]
+    assert sealing.owned == {} and stat.S_IMODE(owned.stat().st_mode) == 0o750
+    with pytest.raises(boring_deploy.Failure, match="belongs to uid"):
+        installing.seal_check([owned], sealing.me + 1)
+    lines = []
+    installing.seal_folders([owned], sealing.me, lines.append)
+    assert sealing.owned == {str(owned): (0, 0)} and lines == [
+        f"sealed {owned}: root's, 0700 (inside, files keep uid {sealing.me})"]
 
 def test_a_relative_home_is_recorded_absolute(env, monkeypatch):
     tmp, home = env

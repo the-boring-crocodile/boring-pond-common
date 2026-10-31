@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-worker-kit"
-version = "0.7.6"
+version = "0.7.11"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "Worker side of the Pond: execution, file tools, task containment and settlement (Linux)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "boring-file-core>=0.7.6,<0.8",
-    "boring-registry>=0.7.6,<0.8",
+    "boring-file-core>=0.7.11,<0.8",
+    "boring-registry>=0.7.11,<0.8",
     "mcp>=2.2.0,<2.3",
     "pydantic>=2.13,<3",
     "httpx2>=2.13,<3",

@@ -8,12 +8,17 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.handlers.revoke import RevocationHandler
+from mcp.server.auth.middleware.client_auth import ClientAuthenticator
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.transport_security import DEFAULT_MAX_REQUEST_BODY_SIZE, RequestBodyLimitMiddleware
+from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from pydantic import AnyHttpUrl
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import Route, request_response
 
 from .clients import AUTH_METHODS
 from .provider import ConsentDetails, Denied, SQLiteIssuer
@@ -128,6 +133,45 @@ def replace_metadata_routes(app: Any, issuer: SQLiteIssuer) -> None:
     if len(kept) == len(routes):
         raise RuntimeError("SDK app has no authorization server metadata route to replace")
     routes[:] = ours + kept
+
+
+def configure_issuer_routes(app: Any, issuer: SQLiteIssuer) -> None:
+    """Install our metadata and the SDK 2.2 revocation compatibility boundary.
+
+    SDK issue #3508 makes the nullable client_secret field required. Only an
+    absent URL-encoded field is supplied here; SDK authentication, validation,
+    token ownership and revocation still decide the result. Remove this adapter
+    once the selected SDK passes our public/basic/post HTTP regressions.
+    """
+    replace_metadata_routes(app, issuer)
+    routes = app.router.routes
+    matches = [i for i, route in enumerate(routes) if getattr(route, "path", None) == "/revoke"]
+    if len(matches) != 1:
+        raise RuntimeError("SDK app has no single revocation route to replace")
+    handler = RevocationHandler(issuer, ClientAuthenticator(issuer))
+
+    async def revoke(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type == "application/x-www-form-urlencoded":
+            body = await request.body()
+            form = await request.form()
+            if "client_secret" not in form:
+                body += b"&client_secret="
+                headers = [(k, v) for k, v in request.scope["headers"] if k.lower() != b"content-length"]
+                scope = {**request.scope, "headers": [*headers, (b"content-length", str(len(body)).encode())]}
+
+                async def receive() -> Any:
+                    return {"type": "http.request", "body": body, "more_body": False}
+
+                request = Request(scope, receive)
+        return await handler.handle(request)
+
+    # Match the SDK's CORS-outside-body-limit order, including chunked requests.
+    endpoint = CORSMiddleware(
+        RequestBodyLimitMiddleware(request_response(revoke), DEFAULT_MAX_REQUEST_BODY_SIZE),
+        allow_origins=["*"], allow_methods=["POST", "OPTIONS"],
+        allow_headers=[MCP_PROTOCOL_VERSION_HEADER])
+    routes[matches[0]] = Route("/revoke", endpoint=endpoint, methods=["POST", "OPTIONS"])
 
 
 class UnderPath:

@@ -21,8 +21,8 @@ def file_lock(path: Path):
                 raise OSError("lock must be a regular single-link file")
             if os.name == "nt":
                 import msvcrt
-                if info.st_size == 0:
-                    os.write(fd, b"0")
+                # Windows permits byte-range locks beyond EOF. Do not initialize byte zero:
+                # another process may already hold its lock after our fstat saw an empty file.
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
             else:

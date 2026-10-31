@@ -184,13 +184,17 @@ class Services:
         return entry
 
     async def _call(self, entry: Entry, token: object, method: str,
-                    send: Callable[[Client], Awaitable[_T]]) -> _T:
+                    send: Callable[[Client], Awaitable[_T]], timeout: float | None = None) -> _T:
         if not isinstance(token, str) or not token:
             raise Refusal("invalid_request", "a service request needs the control plane's token")
         name, url = entry.details["name"], entry.details["url"]
+        # The caller's time left (a carried deadline), never more than the service contract.
+        limit = CALL_TIMEOUT_SECONDS if timeout is None else min(CALL_TIMEOUT_SECONDS, timeout)
+        if limit <= 0:
+            raise Refusal("limit", f"no time left for {method} to {name}; nothing was sent")
         call: dict[str, Any] = {"token": token}
         try:
-            return await asyncio.wait_for(self._request(url, call, send), CALL_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(self._request(url, call, send), limit)
         except httpx2.ConnectError:
             raise Refusal("unavailable", f"{name} accepts no connection at {url}; "
                           "nothing was sent") from None
@@ -200,7 +204,7 @@ class Services:
             raise ServiceFailure({"status": "failed", "code": "service_error", "message": error.message,
                                   "service_code": error.code, "effects": "unknown"}) from None
         except asyncio.TimeoutError:
-            raise TimeoutError(f"{name} did not answer {method} within {CALL_TIMEOUT_SECONDS:g} s; "
+            raise TimeoutError(f"{name} did not answer {method} within {limit:g} s; "
                                "the request may have run") from None
         except httpx2.TransportError as error:
             raise ConnectionError(f"the connection to {name} failed during {method} "
@@ -226,16 +230,21 @@ class Services:
         now = time.monotonic()
         return Entry(f"service/{name}", _never_pinged, {"name": name, "url": url}, now, now)
 
-    async def describe(self, name: object, token: object, *, grant: dict[str, object] | None = None) -> dict[str, object]:
+    async def describe(self, name: object, token: object, *, grant: dict[str, object] | None = None,
+                       timeout: float | None = None) -> dict[str, object]:
         """The service's tools, as its MCP tools/list states them."""
         entry = self._granted(name, grant) if grant is not None else self._available(name)
         listed = await self._call(entry, token, "tools/list", lambda client: client.session.send_request(
-            types.ListToolsRequest(), types.ListToolsResult))
+            types.ListToolsRequest(), types.ListToolsResult), timeout)
         return {"service": name, "tools": [tool.model_dump(by_alias=True, mode="json", exclude_none=True)
                                            for tool in listed.tools]}
 
-    async def call(self, name: object, tool: object, arguments: object, token: object, *, grant: dict[str, object] | None = None) -> dict[str, object]:
-        """One MCP tools/call; the service owns the tool's argument validation."""
+    async def call(self, name: object, tool: object, arguments: object, token: object, *,
+                   grant: dict[str, object] | None = None, timeout: float | None = None) -> dict[str, object]:
+        """One MCP tools/call; the service owns the tool's argument validation. `timeout`:
+        the caller's time left, capped by CALL_TIMEOUT_SECONDS; zero or less is refused
+        (`limit`) before anything is sent. A timeout or broken connection after sending
+        raises (the call may have run); the service's own refusal comes back with its code."""
         entry = self._granted(name, grant) if grant is not None else self._available(name)
         if not isinstance(tool, str) or not tool:
             raise Refusal("invalid_request", "tool must be a nonempty name")
@@ -243,7 +252,7 @@ class Services:
             raise Refusal("invalid_request", "arguments must be an object")
         request = types.CallToolRequest(params=types.CallToolRequestParams(name=tool, arguments=arguments))
         result = await self._call(entry, token, "tools/call", lambda client: client.session.send_request(
-            request, types.CallToolResult))
+            request, types.CallToolResult), timeout)
         if result.is_error:
             raise _tool_refusal(result)
         answer: dict[str, object] = {"content": [item.model_dump(by_alias=True, mode="json", exclude_none=True)

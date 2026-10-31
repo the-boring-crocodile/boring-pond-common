@@ -14,10 +14,9 @@ All of it — code, tests, docs — was written by AI (OpenAI's models and Anthr
 | boring-registry | Crocodile, Pirates, services, pondNT |
 | boring-file-core | Crocodile, Pirates, pondNT |
 | boring-service-kit | Crocodile, services, pondNT |
-| boring-worker-kit | Crocodile, Pirates (Linux only) |
+| [boring-worker-kit](docs/WORKER_KIT.md) | Crocodile, Pirates (Linux only): file tools, commands and service calls |
 | boring-deploy | every component's release: deploy, install, rollback, uninstall ([how it works](packages/boring-deploy/README.md)) |
 
-boring-task-state currently has only Crocodile as a consumer and stays there.
 Common packages must not import a host or service application.
 
 ## Development

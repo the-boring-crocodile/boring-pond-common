@@ -14,7 +14,7 @@ from mcp.server.auth.settings import AuthSettings
 from boring_registry import POND_CALL_MARGIN_SECONDS, POND_CALL_SECONDS, Watchdog
 from .access import AccessPolicy
 from .issuer import DEFAULT_METADATA_HOSTS, ClientPolicy, SQLiteIssuer, Target
-from .issuer.web import UnderPath, auth_settings, install, issuer_paths, replace_metadata_routes
+from .issuer.web import UnderPath, auth_settings, configure_issuer_routes, install, issuer_paths
 from .keys import EitherVerifier, KeyVerifier
 from .pond import (ControlPlane, IntrospectionVerifier, Registration, read_secret, run, wrap_app)
 
@@ -213,7 +213,7 @@ class ServiceConfig:
         install(server, issuer, f"Authorize {server.name}",
                 f"Authorize this client to use {server.name}'s tools as {subject}.")
         app = wrap_app(server, self.url, discover_bypass=self.watchdog is not None,
-                       customize=lambda app: replace_metadata_routes(app, issuer))
+                       customize=lambda app: configure_issuer_routes(app, issuer))
         prefix = urlsplit(issuer.issuer_url).path
         return UnderPath(app, prefix) if prefix.strip("/") else app
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-file-core"
-version = "0.7.6"
+version = "0.7.11"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "File reading, patching and text-format primitives for the Pond"

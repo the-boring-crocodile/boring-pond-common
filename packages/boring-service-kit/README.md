@@ -63,6 +63,17 @@ Tests: `pytest packages/boring-service-kit/tests` with mcp 2.2.0 and
 boring-registry installed. `boring_service_kit.testing` has a fake control
 plane and an in-process client for services' own tests.
 
+## Known limit: the heartbeat is not authenticated
+
+`attach_heartbeat` answers `server/discover` without a token, and a discover
+naming a Pond renews that Pond's liveness. Anyone who reaches the front end
+(behind a public proxy route: anyone) can keep a source "alive" after its
+worker lost it, so the service does not re-register until the spoof stops.
+Availability only: the answer carries the server's name, version and
+capabilities, no data; tools still need a token. A ping token from the
+registration is planned. Until then, a service
+that does not re-register after a worker restart: restart the service.
+
 ## Optional process containment
 
 Consumers using Tree install boring-service-kit[process]; its Windows extra

@@ -74,7 +74,7 @@ class ServiceConfig:
     | `issuer` | this server: approval secret, pre-registered and metadata-document clients |
     | `oauth` | an external issuer, checked by introspection (a Crocodile, Keycloak, Entra) |
     | `keys` | nobody: static access keys (combines with either of the above) |
-    | `pond` | (heartbeat registration with a Crocodile, beside `oauth`) |
+    | `pond` | (heartbeat registration with a Crocodile, beside `oauth`; never with `issuer`) |
 
     `access` lists the subjects an issuer may vouch for, each a reader or writer.
     """
@@ -92,6 +92,9 @@ class ServiceConfig:
             raise ValueError("config needs issuer, oauth or keys")
         if "oauth" in data and "issuer" in data:
             raise ValueError("oauth and issuer exclude each other: tokens come from one issuer")
+        if "issuer" in data and data.get("pond") is not None:
+            raise ValueError("issuer and pond exclude each other: a Pond calls only with the Crocodile's tokens "
+                             "(oauth); a server with its own sign-in serves a person's client directly")
         if "access" in data and not {"oauth", "issuer"} & set(data):
             raise ValueError("access lists OAuth subjects; with keys only, each key names its person and role")
         self._listen(data)

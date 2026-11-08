@@ -9,4 +9,4 @@
 Services depend on this package's releases; `pond` needs boring-registry.
 """
 
-__version__ = "0.7.11"
+__version__ = "0.7.13"

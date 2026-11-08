@@ -714,7 +714,7 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
                 ctx.installed = installed_version(home, release.runtime)
                 step = "verify"
             print(f"1 verify  {release.component} {release.version} into {home} "
-                  f"(installed: {ctx.installed or 'none'})")
+                  f"(installed: {ctx.installed or 'none'})", flush=True)
             check_home(release, home)
             runtime.check_host(ctx)
             generation = hook("data_generation")
@@ -727,19 +727,19 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
                 return 0
             take_backup = decide_backup(release, generation, args.backup)
             step = "prepare"
-            print("2 prepare")
+            print("2 prepare", flush=True)
             runtime.prepare(ctx)
             step = "check"
-            print("3 check")
+            print("3 check", flush=True)
             hook("check")
             ctx.running_healthy = hook("healthy")
             if take_backup:
                 step = "backup"
                 target = home / "backups" / datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 target.mkdir(parents=True, mode=0o700)
-                print(f"- backup  {hook('backup', target)}")
+                print(f"- backup  {hook('backup', target)}", flush=True)
             step = "switch"
-            print("4 switch")
+            print("4 switch", flush=True)
             units = hook("units", default=[])
             if hasattr(runtime, "check_units"):
                 runtime.check_units(ctx, units)  # before anything that runs changes
@@ -749,22 +749,22 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
             stopped = ctx.not_started
             if stopped:
                 print(f"5 start  site is stopped: not started (stopped before the update, so left stopped: "
-                      f"{', '.join(ctx.stopped)})")
-                print("6 smoke  skipped: nothing of it runs")
+                      f"{', '.join(ctx.stopped)})", flush=True)
+                print("6 smoke  skipped: nothing of it runs", flush=True)
             else:
-                print("5 start")
+                print("5 start", flush=True)
                 if ctx.stopped:
                     ctx.log("stopped before the update, so not started: " + ", ".join(ctx.stopped))
                 runtime.wait(ctx, ctx.restarted)
                 step = "smoke"
-                print("6 smoke")
+                print("6 smoke", flush=True)
                 hook("smoke")
             step = "record"
             older = ctx.installed and version_key(release.version) < version_key(ctx.installed)
             record(ctx, "rollback" if older else "deploy")
             print(f"7 record  {release.component} {release.version} is "
                   + (f"installed, not started ({runtime.START.replace('HOME', str(home))})" if stopped
-                     else "live"))
+                     else "live"), flush=True)
             hint = rollback_hint(runtime, home, release.version)
             if hint:
                 print(f"  {hint}")

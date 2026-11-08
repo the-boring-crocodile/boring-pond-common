@@ -28,10 +28,12 @@ uses the rest (a service that routes requests itself may call `wrap_app` and
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import math
+import socket
 import time
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -220,19 +222,53 @@ class Registration:
                 f"registered, sources {sorted(sources)}, interval {interval:g} s")
 
 
+BIND_WAIT_SECONDS = 20.0
+
+
+async def bind_socket(host: str, port: int, timeout: float = BIND_WAIT_SECONDS) -> socket.socket:
+    """Acquire the actual listener, waiting briefly only for an address still in use."""
+    deadline = time.monotonic() + timeout
+    waiting = False
+    while True:
+        listener = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((host, port))
+            listener.set_inheritable(True)
+            if waiting:
+                log.info("listener %s:%s is available; starting", host, port)
+            return listener
+        except OSError as error:
+            listener.close()
+            if error.errno not in (errno.EADDRINUSE, 10048) and getattr(error, "winerror", None) != 10048:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.error("listener %s:%s still in use after %.1f seconds", host, port, timeout)
+                raise
+            if not waiting:
+                log.warning("listener %s:%s is in use; waiting up to %.1f seconds", host, port, timeout)
+                waiting = True
+            await asyncio.sleep(min(0.25, remaining))
+
+
 async def run(app: Any, watchdog: Watchdog | None, host: str, port: int) -> None:
-    """Serve the app and keep the registration alive until uvicorn stops."""
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", lifespan="on"))
-    heartbeat = asyncio.create_task(watchdog.run(), name="registration-watchdog") if watchdog is not None else None
-    if heartbeat is not None:
-        heartbeat.add_done_callback(_report_watchdog_end)
-    try:
-        await server.serve()
-    finally:
+    """Acquire the listener once, then serve and register until uvicorn stops."""
+    with closing(await bind_socket(host, port)) as listener:
+        server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", lifespan="on"))
+        heartbeat = asyncio.create_task(watchdog.run(), name="registration-watchdog") if watchdog is not None else None
         if heartbeat is not None:
-            heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat
+            heartbeat.add_done_callback(_report_watchdog_end)
+        try:
+            await server.serve(sockets=[listener])
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
 
 
 def _report_watchdog_end(task: asyncio.Task[None]) -> None:

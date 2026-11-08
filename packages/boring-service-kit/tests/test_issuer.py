@@ -370,6 +370,13 @@ def test_config_rules_for_the_issuer(tmp_path):
         load({**base, "oauth": {}, "access": []})
     with pytest.raises(ValueError, match="issuer supports"):
         load({**base, "issuer": {**base["issuer"], "registration": True}, "access": []})
+    # Every Pond call carries the Crocodile's token, which an issuer of its own would refuse: refused
+    # before any file is read (the pond secret need not exist); a null pond is no registration
+    access = [{"subject": "robin", "role": "writer"}]
+    pond = {"url": "https://pond.example", "client_id": "svc", "secret_file": "missing"}
+    with pytest.raises(ValueError, match="issuer and pond exclude each other"):
+        load({**base, "access": access, "pond": pond})
+    assert load({**base, "access": access, "pond": None}).watchdog is None
 
 
 def test_remove_and_prune(tmp_path):

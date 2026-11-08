@@ -280,7 +280,7 @@ def report(ctx: Context, look: Look) -> None:
 def step_zero(ctx: Context, install_steps: Any, args: argparse.Namespace) -> bool:
     """Before step 1. True: go on with the deploy. False: --check of a first
     install, which stops after its plan."""
-    print(f"0 install? {ctx.release.component} in {ctx.home}")
+    print(f"0 install? {ctx.release.component} in {ctx.home}", flush=True)
     elsewhere = _recorded_elsewhere(ctx)
     if elsewhere is not None:
         raise Failure(f"{ctx.release.component} is recorded at {elsewhere} ({_homes_file()}), which exists",
@@ -368,7 +368,7 @@ def _uninstall(ctx: Context, install_steps: Any, args: argparse.Namespace) -> in
     if instance is not None and ctx.instance is None:
         raise Failure(f"name the one to uninstall: --{instance.name}")
     what = release.component + (f" {ctx.instance}" if ctx.instance else "")
-    print(f"1 look  {what} in {home}")
+    print(f"1 look  {what} in {home}", flush=True)
     look = install_steps.look(ctx)
     report(ctx, look)
     if not look.installed:
@@ -380,11 +380,11 @@ def _uninstall(ctx: Context, install_steps: Any, args: argparse.Namespace) -> in
         data = " and its account" if args.delete_data else ""
         if input(f"Uninstall {what}{data} from {home}? [y/N] ").strip().lower() not in ("y", "yes"):
             raise Failure("not uninstalled (declined)")
-    print("2 uninstall")
+    print("2 uninstall", flush=True)
     kept = install_steps.uninstall(ctx, args.delete_data)
     record(ctx, "uninstall" + (f":{ctx.instance}" if ctx.instance else ""))
     _forget_home(ctx, install_steps)
-    print(f"3 done  {what} is uninstalled")
+    print(f"3 done  {what} is uninstalled", flush=True)
     if kept:
         print("  kept, no longer live (delete by hand once nothing in them is needed):")
         for path in kept:

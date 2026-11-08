@@ -4,6 +4,20 @@ All packages share one version (VERSION, `scripts/version.py`). While the
 major version is 0, a breaking API change raises the minor version; consumers
 depend on `>=0.N.0,<0.(N+1)`.
 
+## 0.7.13 — 2026-11-07
+
+- service-kit: a config with both `issuer` and `pond` is refused: a Pond calls only with the
+  Crocodile's tokens, which a server's own sign-in would refuse. MCP Ferry checked this alone
+  until now.
+- deploy: every numbered step line (deploy, first install, uninstall) is flushed as it is printed,
+  so through a pipe it appears in order with the hooks' output and before a `FAILED` line.
+
+## 0.7.12 — 2026-11-05
+
+- service-kit: shared HTTP startup waits up to 20 seconds when the listener is
+  still held during a restart. It logs the wait, reserves the actual socket
+  and hands that socket to uvicorn; other bind errors fail immediately.
+
 ## 0.7.11 — 2026-10-30
 
 Everything since 0.7.6. Every family member builds on this release.

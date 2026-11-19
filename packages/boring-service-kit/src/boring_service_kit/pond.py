@@ -255,10 +255,10 @@ async def bind_socket(host: str, port: int, timeout: float = BIND_WAIT_SECONDS) 
             await asyncio.sleep(min(0.25, remaining))
 
 
-async def run(app: Any, watchdog: Watchdog | None, host: str, port: int) -> None:
+async def run(app: Any, watchdog: Watchdog | None, host: str, port: int, *, access_log: bool = True) -> None:
     """Acquire the listener once, then serve and register until uvicorn stops."""
     with closing(await bind_socket(host, port)) as listener:
-        server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", lifespan="on"))
+        server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", lifespan="on", access_log=access_log))
         heartbeat = asyncio.create_task(watchdog.run(), name="registration-watchdog") if watchdog is not None else None
         if heartbeat is not None:
             heartbeat.add_done_callback(_report_watchdog_end)

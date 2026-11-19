@@ -6,7 +6,7 @@ from pathlib import Path
 from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit.files import FileTools
 from boring_worker_kit.observation import Observation, watch_path
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 from boring_worker_kit.settings import EnvironmentSettings, valid_unit_prefix
 
 
@@ -39,11 +39,11 @@ class ConsumerNeutralTest(unittest.TestCase):
             self.assertEqual(plain._file_call("file_read", {"operation": "file_read", "request_id": "t",
                                                             "root": "work", "path": ".pirate-notes"})["content"], "mine")
             pirate = FileTools(policy, root / "locks-b", reserved_prefixes=(".pirate-",))
-            with self.assertRaises(Refusal):
+            with self.assertRaises(Refused):
                 pirate._file_call("file_read", {"operation": "file_read", "request_id": "t",
                                                 "root": "work", "path": ".pirate-notes"})
             for tools in (plain, pirate):
-                with self.assertRaises(Refusal):
+                with self.assertRaises(Refused):
                     tools._file_call("file_read", {"operation": "file_read", "request_id": "t",
                                                    "root": "work", "path": ".boring-file-x"})
 

@@ -10,7 +10,7 @@ from .settings import ExecutionSettings as EnvironmentSettings
 from .host_limits import HOST_INSPECTION_SECONDS, HostLimits, TASK_OVERHEAD_SECONDS
 from .inputs import MAX_JOB_SECONDS
 from .framing import MAX_COMMAND_BYTES
-from .outcomes import Refusal
+from .outcomes import Refused
 from .task_client import ContainmentError, TaskCgroup, TaskClient
 
 
@@ -22,7 +22,7 @@ INTERRUPTED_MESSAGE = ("foreground request deadline exceeded; task cleanup compl
                        "command may have started")
 
 
-class ForegroundAdmissionTimeout(Refusal):
+class ForegroundAdmissionTimeout(Refused):
     """The command did not enter the executor before the deadline: not started."""
 
     def __init__(self, message: str = NOT_ADMITTED_MESSAGE) -> None:
@@ -45,24 +45,24 @@ def prepare_command(settings: EnvironmentSettings, command: str, cwd: str | None
                     timeout_seconds: float | None, limits: HostLimits,
                     *, is_job: bool = False) -> tuple[str, float]:
     if not isinstance(command, str) or not command:
-        raise Refusal("invalid_request", 'command must be a non-empty string')
+        raise Refused("invalid_request", 'command must be a non-empty string')
     if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
-        raise Refusal("limit", f'command exceeds {MAX_COMMAND_BYTES} UTF-8 bytes')
+        raise Refused("limit", f'command exceeds {MAX_COMMAND_BYTES} UTF-8 bytes')
     requested = Path(cwd or settings.default_cwd)
     if not requested.is_absolute():
         requested = settings.default_cwd / requested
     effective_cwd = requested.resolve()
     if not any(effective_cwd == root or root in effective_cwd.parents
                for root in settings.allowed_roots):
-        raise Refusal("invalid_request", 'working directory is outside allowed roots')
+        raise Refused("invalid_request", 'working directory is outside allowed roots')
     if timeout_seconds is not None and (type(timeout_seconds) not in (int, float)
                                         or not math.isfinite(timeout_seconds)):
-        raise Refusal("invalid_request", 'timeout must be a finite number')
+        raise Refused("invalid_request", 'timeout must be a finite number')
     timeout = 120.0 if timeout_seconds is None else float(timeout_seconds)
     if timeout < 0.1:
-        raise Refusal("invalid_request", 'timeout_seconds must be at least 0.1')
+        raise Refused("invalid_request", 'timeout_seconds must be at least 0.1')
     if is_job and timeout > MAX_JOB_SECONDS:
-        raise Refusal("invalid_request", f'a job timeout_seconds is at most {MAX_JOB_SECONDS:g}')
+        raise Refused("invalid_request", f'a job timeout_seconds is at most {MAX_JOB_SECONDS:g}')
     return str(effective_cwd), min(timeout, limits.job_max_seconds if is_job
                                    else limits.exec_timeout_seconds)
 

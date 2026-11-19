@@ -94,6 +94,17 @@ class DirectoryTest(Base):
             self.assertEqual(read_regular(inner, "f", 10)[0], b"x")
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
+    def test_missing_folder_names_the_first_missing_relative_path_and_closes_descriptors(self) -> None:
+        (self.root / "present").mkdir()
+        before = len(os.listdir("/proc/self/fd"))
+        with root_fd(self.root) as fd, self.assertRaises(FileNotFoundError) as caught:
+            with directory_fd(fd, ("present", "missing", "deeper")):
+                pass
+        self.assertEqual(caught.exception.filename, "present/missing")
+        self.assertIn("folder does not exist", str(caught.exception))
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.assertFalse((self.root / "present" / "missing").exists())
+
     def test_file_in_the_middle_of_a_path_is_refused(self) -> None:
         (self.root / "f").write_text("x")
         with root_fd(self.root) as fd, self.assertRaises(NotADirectoryError):
@@ -108,8 +119,10 @@ class ReadTest(Base):
 
     def test_symlinked_file_is_not_followed(self) -> None:
         (self.root / "link").symlink_to(self.outside / "secret")
-        with self.assertRaises(OSError):
+        with self.assertRaises(NotAllowedFile) as caught:
             self.read("link")
+        self.assertEqual(caught.exception.kind, "symlink")
+        self.assertIn("do not follow links", str(caught.exception))
 
     def test_fifo_is_refused_without_blocking(self) -> None:
         os.mkfifo(self.root / "pipe")
@@ -135,6 +148,21 @@ class ReadTest(Base):
         with self.assertRaises((NotAllowedFile, OSError)):
             self.read("d")
 
+    def test_refused_kinds_and_actionable_messages(self) -> None:
+        import socket
+        (self.root / "folder").mkdir()
+        os.mkfifo(self.root / "fifo")
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(self.root / "socket"))
+        for name, kind, message in (("folder", "directory", "use file_list"),
+                                     ("fifo", "other", "FIFOs"),
+                                     ("socket", "other", "sockets")):
+            with self.subTest(name=name), self.assertRaises(NotAllowedFile) as caught:
+                self.read(name)
+            self.assertEqual(caught.exception.kind, kind)
+            self.assertIn(message, str(caught.exception))
+
     def test_size_limit_is_exact(self) -> None:
         (self.root / "f").write_bytes(b"x" * 10)
         self.assertEqual(self.read("f", 10), b"x" * 10)
@@ -155,8 +183,10 @@ class ReadTest(Base):
         (self.root / "f").write_text("x")
         os.link(self.root / "f", self.root / "g")
         self.assertEqual(self.read("f"), b"x")
-        with self.assertRaises(NotAllowedFile):
+        with self.assertRaises(NotAllowedFile) as caught:
             self.read("f", single_link=True)
+        self.assertEqual(caught.exception.kind, "other")
+        self.assertIn("multiple hard links", str(caught.exception))
 
 
 class WriteTest(Base):

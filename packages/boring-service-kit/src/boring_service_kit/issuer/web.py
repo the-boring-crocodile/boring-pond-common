@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route, request_response
 
-from .clients import AUTH_METHODS
+from .clients import AUTH_METHODS, ClientPolicy
 from .provider import ConsentDetails, Denied, SQLiteIssuer
 
 APPROVAL_BODY_BYTES = 16384
@@ -83,12 +83,18 @@ def page(title: str, body: str) -> str:
 
 def auth_settings(issuer: SQLiteIssuer, resource_url: str, required_scopes: list[str] | None = None) -> AuthSettings:
     """SDK settings for a server that is its own issuer."""
-    scopes = list(issuer.policy.scopes)
+    return issuer_auth_settings(issuer.issuer_url, resource_url, issuer.policy, required_scopes)
+
+
+def issuer_auth_settings(issuer_url: str, resource_url: str, policy: ClientPolicy,
+                         required_scopes: list[str] | None = None) -> AuthSettings:
+    """Validate SDK settings from issuer configuration, without opening its store."""
+    scopes = list(policy.scopes)
     return AuthSettings(
-        issuer_url=AnyHttpUrl(issuer.issuer_url), resource_server_url=AnyHttpUrl(resource_url),
+        issuer_url=AnyHttpUrl(issuer_url), resource_server_url=AnyHttpUrl(resource_url),
         required_scopes=required_scopes if required_scopes is not None else scopes,
         client_registration_options=ClientRegistrationOptions(
-            enabled=issuer.policy.dynamic_registration, valid_scopes=scopes, default_scopes=scopes),
+            enabled=policy.dynamic_registration, valid_scopes=scopes, default_scopes=scopes),
         revocation_options=RevocationOptions(enabled=True), validate_token_resource=True)
 
 

@@ -129,3 +129,15 @@ def test_run_passes_the_reserved_socket_and_closes_it(monkeypatch):
     monkeypatch.setattr(pond.uvicorn, "Server", Server)
     asyncio.run(pond.run(object(), None, "127.0.0.1", 0))
     assert len(captured) == 1 and captured[0].fileno() == -1
+
+
+def test_run_can_disable_raw_url_access_logs(monkeypatch):
+    captured = []
+    class Server:
+        def __init__(self, config):
+            captured.append(config.access_log)
+        async def serve(self, sockets):
+            pass
+    monkeypatch.setattr(pond.uvicorn, "Server", Server)
+    asyncio.run(pond.run(object(), None, "127.0.0.1", 0, access_log=False))
+    assert captured == [False]

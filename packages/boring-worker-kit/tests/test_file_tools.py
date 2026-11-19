@@ -9,7 +9,7 @@ from pathlib import Path
 
 from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit.files import FileTools
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 def sha(data: bytes) -> str:
@@ -40,6 +40,74 @@ class FileToolsEffectTest(unittest.IsolatedAsyncioTestCase):
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+    async def test_every_read_and_write_carries_refused_file_kind(self):
+        import socket
+        (self.root / "folder").mkdir()
+        (self.root / "regular").write_text("original")
+        (self.root / "link").symlink_to(self.root / "regular")
+        os.mkfifo(self.root / "fifo")
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(self.root / "socket"))
+        operations = (("file_read", {}), ("file_read_bytes", {}),
+                      ("file_write", {"content": "new", "expected_sha256": None}),
+                      ("file_write_bytes", {"data": "", "expected_sha256": None}),
+                      ("file_patch", {"expected_sha256": sha(b"original"),
+                                      "edits": [{"old_text": "original", "new_text": "new"}]}))
+        for name, kind, message in (("folder", "directory", "use file_list"),
+                                   ("link", "symlink", "do not follow links"),
+                                   ("fifo", "other", "FIFOs"), ("socket", "other", "sockets")):
+            for operation, extra in operations:
+                with self.subTest(name=name, operation=operation), self.assertRaises(Refused) as caught:
+                    await self.tools.call(operation, {"root": "work", "path": name, **extra})
+                outcome = caught.exception.as_data()
+                self.assertEqual((outcome["status"], outcome["code"], outcome["kind"]),
+                                 ("refused", "forbidden", kind))
+                self.assertIn(message, outcome["message"])
+            with self.subTest(name=name, operation="read_whole"), self.assertRaises(Refused) as caught:
+                await self.tools.read_whole("work", name, 100)
+            self.assertEqual(caught.exception.as_data()["kind"], kind)
+        self.assertEqual((self.root / "regular").read_text(), "original")
+
+    async def test_hard_link_write_has_distinct_wording(self):
+        (self.root / "a").write_text("original")
+        os.link(self.root / "a", self.root / "b")
+        for operation, extra in (
+                ("file_write", {"content": "new", "expected_sha256": sha(b"original")}),
+                ("file_write_bytes", {"data": "", "expected_sha256": sha(b"original")}),
+                ("file_patch", {"expected_sha256": sha(b"original"),
+                                "edits": [{"old_text": "original", "new_text": "new"}]})):
+            with self.subTest(operation=operation), self.assertRaises(Refused) as caught:
+                await self.tools.call(operation, {"root": "work", "path": "a", **extra})
+            outcome = caught.exception.as_data()
+            self.assertEqual((outcome["code"], outcome["kind"]), ("forbidden", "other"))
+            self.assertIn("multiple hard links", outcome["message"])
+        self.assertEqual((self.root / "b").read_text(), "original")
+
+    async def test_every_write_names_missing_folder_and_how_to_recover(self):
+        (self.root / "present").mkdir()
+        for operation, extra in (
+                ("file_write", {"content": "new", "expected_sha256": None}),
+                ("file_write_bytes", {"data": "", "expected_sha256": None}),
+                ("file_patch", {"expected_sha256": sha(b"old"),
+                                "edits": [{"old_text": "old", "new_text": "new"}]})):
+            with self.subTest(operation=operation), self.assertRaises(Refused) as caught:
+                await self.tools.call(operation, {"root": "work",
+                    "path": "present/missing/deeper/file", **extra})
+            outcome = caught.exception.as_data()
+            self.assertEqual((outcome["status"], outcome["code"], outcome["path"]),
+                             ("refused", "not_found", "present/missing"))
+            self.assertIn("folder 'present/missing' does not exist", outcome["message"])
+            self.assertIn(f"{operation} does not create folders", outcome["message"])
+            self.assertIn("create it first or choose another path", outcome["message"])
+        self.assertFalse((self.root / "present" / "missing").exists())
+        self.assertFalse(self.locks.exists())
+
+    async def test_missing_read_folder_keeps_read_wording(self):
+        with self.assertRaises(Refused) as caught:
+            await self.tools.call("file_read", {"root": "work", "path": "missing/file"})
+        self.assertEqual(caught.exception.message, "directory does not exist")
 
     async def test_new_file_lands_with_content_and_default_mode(self):
         result = await self.tools.call("file_write", {"root": "work", "path": "new.txt",
@@ -72,7 +140,7 @@ class FileToolsEffectTest(unittest.IsolatedAsyncioTestCase):
         for operation, extra in (("file_write", {"content": "replaced\n"}),
                                  ("file_patch", {"edits": [{"old_text": "original", "new_text": "patched"}]})):
             with self.subTest(operation=operation):
-                with self.assertRaises(Refusal) as caught:
+                with self.assertRaises(Refused) as caught:
                     await self.tools.call(operation, {"root": "work", "path": "keep.txt",
                                                       "expected_sha256": sha(b"something else"), **extra})
                 self.assertEqual(caught.exception.code, "stale")

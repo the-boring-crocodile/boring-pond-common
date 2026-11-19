@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-file-core"
-version = "0.7.13"
+version = "0.8.0"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "File reading, patching and text-format primitives for the Pond"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = []
 
 [tool.setuptools.packages.find]

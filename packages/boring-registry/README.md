@@ -1,6 +1,6 @@
 # boring-registry
 
-Registrations kept alive by a heartbeat. Python >= 3.10, no dependencies. One module: `src/boring_registry/__init__.py`.
+Registrations kept alive by a heartbeat. Python >= 3.12, no dependencies. One module: `src/boring_registry/__init__.py`.
 
 Soft state only. Nothing is persisted: the registry lives in the worker's
 memory, and after a worker restart guests register again within about two

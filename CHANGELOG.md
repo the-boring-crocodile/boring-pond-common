@@ -1,8 +1,36 @@
 # Changelog
 
-All packages share one version (VERSION, `scripts/version.py`). While the
-major version is 0, a breaking API change raises the minor version; consumers
-depend on `>=0.N.0,<0.(N+1)`.
+## 0.8.0 — 2026-11-19
+
+### Upgrading
+
+Common requires Python 3.12 or newer. Use the matching release and lock files
+in each family consumer.
+
+Approval secrets must contain at least 24 characters after trimming
+whitespace. A service with its own sign-in now checks this at startup and
+again when approving a sign-in. Check the file's length without displaying
+its value. Generate a replacement in a private working directory if needed.
+
+~~~sh
+sudo python3 -c 'from pathlib import Path; import sys; print(len(Path(sys.argv[1]).read_text(encoding="utf-8").strip()))' /path/to/approval-secret
+(umask 077; set -C; openssl rand -hex 32 > new-approval-secret)
+~~~
+
+Install the replacement as the component's approval file with its required
+ownership and permissions. Repeat the length check on the installed file.
+
+### Changes
+
+- The shared outcome vocabulary gives Linux and Windows tools the same
+  refusal and failure shape.
+- Boring Deploy checks installation inputs and root-owned paths before
+  making changes. Container installs track the managed image in
+  boring-image.env and preserve the operator's .env.
+- Service authentication uses one explicit mode. Crocodile supplies the
+  caller role, access keys carry their own role, and a standalone issuer
+  uses the configured role. Container listener settings come from Compose.
+- Use job_wait with wait_seconds set to 0 in place of job_status.
 
 ## 0.7.13 — 2026-11-07
 

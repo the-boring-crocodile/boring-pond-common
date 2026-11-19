@@ -6,7 +6,7 @@ import pytest
 from boring_worker_kit import file_refs
 from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit.files import FileTools
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def ref(path="later.txt", root="work", **extra):
 ])
 def test_invalid_calls_refused_without_reading(files, arguments, save_to, code):
     with patch.object(files, "call", side_effect=AssertionError("admission must not read")):
-        with pytest.raises(Refusal) as caught:
+        with pytest.raises(Refused) as caught:
             file_refs.prepare_call(files, arguments, save_to)
     assert caught.value.code == code
 

@@ -14,7 +14,7 @@ from unittest.mock import patch
 from boring_worker_kit import deadlines, file_refs
 from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit.files import FileTools
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 from boring_worker_kit.services import CALL_TIMEOUT_SECONDS, Services
 
 
@@ -64,10 +64,10 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
                                 ({"v": ref("a.txt", sha256="0" * 64)}, "stale"),
                                 ({"v": ref("latin.txt")}, "invalid_request"),
                                 ({"v": {"$file": "a.txt"}}, "invalid_request")):
-            with self.subTest(arguments=arguments), self.assertRaises(Refusal) as caught:
+            with self.subTest(arguments=arguments), self.assertRaises(Refused) as caught:
                 await self.run_call(arguments)
             self.assertEqual(caught.exception.code, code)
-        with patch.object(file_refs, "MAX_REFERENCE_BYTES", 1), self.assertRaises(Refusal) as caught:
+        with patch.object(file_refs, "MAX_REFERENCE_BYTES", 1), self.assertRaises(Refused) as caught:
             await self.run_call({"v": ref("a.txt"), "w": ref("a.txt")})
         self.assertEqual(caught.exception.code, "limit")
         self.assertEqual(self.calls, [])
@@ -81,10 +81,10 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
         for save_to, code in (({"root": "work", "path": "out.txt", "expected_sha256": None}, "stale"),
                               ({"root": "work", "path": "no/dir/x.txt", "expected_sha256": None}, "not_found"),
                               ({"root": "work", "path": "x.txt"}, "invalid_request")):
-            with self.subTest(save_to=save_to), self.assertRaises(Refusal) as caught:
+            with self.subTest(save_to=save_to), self.assertRaises(Refused) as caught:
                 await self.run_call({}, save_to)
             self.assertEqual(caught.exception.code, code)
-        with self.assertRaises(Refusal):  # a read-only root
+        with self.assertRaises(Refused):  # a read-only root
             await self.run_call({}, {"root": "notes", "path": "n.txt", "expected_sha256": None})
         self.assertEqual(len(self.calls), 1)  # only the first call reached the service
 
@@ -98,6 +98,8 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.files, "call", disk_full):
             result = await self.run_call({"v": 1}, {"root": "work", "path": "full.txt", "expected_sha256": None})
         self.assertIn("content", result)
+        self.assertEqual(result["save_to_failed"]["status"], "failed")
+        self.assertEqual(result["save_to_failed"]["code"], "write_failed")
         self.assertEqual(result["save_to_failed"]["effects"], "unknown")  # a failure, not a refusal
         self.assertIn("No space left", result["save_to_failed"]["message"])
         self.assertNotIn("save_to_refused", result)
@@ -114,11 +116,19 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
         await self.run_call({}, deadline=deadlines.deadline_after(300.0))
         self.assertEqual(self.calls[-1][1], CALL_TIMEOUT_SECONDS)  # never more than the contract
         count = len(self.calls)
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.run_call({}, deadline=deadlines.deadline_after(0.0))
-        self.assertEqual(caught.exception.code, "limit")
+        self.assertEqual(caught.exception.code, "not_admitted")
         self.assertEqual(len(self.calls), count)
 
+
+    async def test_deadline_expires_after_preparation_without_dispatch(self):
+        with patch.object(file_refs, "left", side_effect=[1.0, 0.0]), self.assertRaises(Refused) as caught:
+            await self.run_call({}, deadline=1.0)
+        self.assertEqual(caught.exception.as_data(), {
+            "status": "refused", "code": "not_admitted",
+            "message": "no time left for the service call in this request; nothing was sent"})
+        self.assertEqual(self.calls, [])
 
     async def test_slow_reads_before_the_call_count_against_the_deadline(self):
         (self.work / "a.txt").write_text("x")
@@ -127,9 +137,9 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
         async def slow(operation, request, **kw):
             await asyncio.sleep(1)
             return await real(operation, request, **kw)
-        with patch.object(self.files, "call", slow), self.assertRaises(Refusal) as caught:
+        with patch.object(self.files, "call", slow), self.assertRaises(Refused) as caught:
             await self.run_call({"v": ref("a.txt")}, deadline=deadlines.deadline_after(0.2))
-        self.assertEqual(caught.exception.code, "limit")
+        self.assertEqual(caught.exception.code, "not_admitted")
         self.assertIn("nothing was sent", caught.exception.message)
         self.assertEqual(self.calls, [])
 
@@ -149,6 +159,8 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
                 self.files, {"v": 1}, {"root": "work", "path": "slow.txt", "expected_sha256": None}, self.echo,
                 deadlines.deadline_after(0.5), on_late_save=late.append)
             self.assertIn("content", result)  # the service ran; its answer is not lost
+            self.assertEqual(result["save_to_failed"]["status"], "failed")
+            self.assertEqual(result["save_to_failed"]["code"], "timeout")
             self.assertEqual(result["save_to_failed"]["effects"], "unknown")  # it may still land
             self.assertFalse((self.work / "slow.txt").exists())
             release.set()
@@ -237,7 +249,7 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
         async def counting(operation, request, **kw):
             read.append(operation)
             return await real(operation, request, **kw)
-        with patch.object(self.files, "call", counting), self.assertRaises(Refusal) as caught:
+        with patch.object(self.files, "call", counting), self.assertRaises(Refused) as caught:
             await self.run_call(ref("a.txt"))
         self.assertEqual((caught.exception.code, read, self.calls), ("invalid_request", [], []))
 
@@ -251,7 +263,7 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
 
         async def refused(operation, request, **kw):
             if operation == "file_write":
-                raise Refusal("forbidden", "no")
+                raise Refused("forbidden", "no")
             return await real(operation, request, **kw)
         with patch.object(self.files, "call", refused):
             result = await file_refs.call_service(
@@ -259,7 +271,8 @@ class FileRefsTest(unittest.IsolatedAsyncioTestCase):
                 self.echo, max_inline_answer=1000)
         self.assertNotIn("content", result)
         self.assertTrue(result["service_ran"])
-        self.assertEqual(result["save_to_refused"]["code"], "forbidden")
+        self.assertEqual(result["save_to_refused"], {
+            "status": "refused", "code": "forbidden", "message": "no"})
 
 
 class DeadlineTest(unittest.TestCase):
@@ -293,6 +306,6 @@ class ServiceTimeoutTest(unittest.IsolatedAsyncioTestCase):
         services.register({"name": "quiet", "url": f"http://127.0.0.1:{port}/mcp"})
         with self.assertRaisesRegex(TimeoutError, r"within 0\.3 s"):
             await services.call("quiet", "x", {}, "token", timeout=0.3)
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await services.call("quiet", "x", {}, "token", timeout=0)
-        self.assertEqual(caught.exception.code, "limit")
+        self.assertEqual(caught.exception.code, "not_admitted")

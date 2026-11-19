@@ -13,7 +13,7 @@ from .framing import read_frame, write_frame
 from .settings import ExecutionSettings as EnvironmentSettings
 from .observation import Observation
 from .host_limits import HOST_INSPECTION_SECONDS, TASK_OVERHEAD_SECONDS
-from .outcomes import Refusal
+from .outcomes import Refused
 
 
 class ContainmentError(RuntimeError):
@@ -176,9 +176,9 @@ class TaskClient:
             await self._close(writer)
             logger.info("task greeting failed before dispatch: %s", type(error).__name__)
             if isinstance(error, asyncio.IncompleteReadError):
-                raise Refusal("not_admitted", "task runner closed the connection before dispatch; "
+                raise Refused("not_admitted", "task runner closed the connection before dispatch; "
                                               "no command was started") from None
-            raise Refusal("not_admitted", f"task runner did not answer within {GREETING_SECONDS:g} "
+            raise Refused("not_admitted", f"task runner did not answer within {GREETING_SECONDS:g} "
                                           "seconds; no command was started") from None
         except BaseException:
             await self._close(writer)

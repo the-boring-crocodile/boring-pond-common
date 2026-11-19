@@ -10,8 +10,8 @@ changes and shared implementation changes require coordinated consumer checks.
 | `outcomes` | `Refused` (nothing changed) and `Failed` (may have had effects) |
 | `calllog` | one JSON line per tool call, arguments summarised |
 | `tools` | compact results, outcomes as `isError`, lean schemas, strict arguments with one-line errors, `default_state_dir(service)` |
-| `access` | verified issuer/subject, unique aliases and reader/writer checks |
-| `http` | `ServiceConfig`: how any server goes on the network (its own issuer, an external one, access keys; optional Pond heartbeat) |
+| `access` | canonical verified issuer/subject attribution and reader/writer checks |
+| `http` | `ServiceConfig`: how any server goes on the network (one explicit Crocodile, keys or own-issuer mode) |
 | `issuer` | an OAuth 2.1 authorization server in one SQLite file: pre-registered and metadata-document clients, optional dynamic registration, the approval page; `boring-service-oauth` |
 | `pond` | the parts `ServiceConfig` is built from: token introspection, the `server/discover` heartbeat (`attach_heartbeat`), registration, `wrap_app` |
 | `process` | standalone tree containment and wait/cleanup settlement; no server dependency |
@@ -21,30 +21,56 @@ changes and shared implementation changes require coordinated consumer checks.
 Every server, service or not, starts from one JSON file (`--config`), read by
 `ServiceConfig`. Where its tokens come from:
 
-| Section | Tokens come from | For |
-|---|---|---|
-| `issuer` | the server itself | a lone server used from Claude, ChatGPT, VS Code |
-| `oauth` | an external issuer, by introspection (a Crocodile, Keycloak, Entra) | family installs, companies |
-| `keys` | nobody: static access keys (`boring-service-keys`); combines with either | scripts, local clients |
-| `pond` | (heartbeat registration with a Crocodile, beside `oauth`) | family installs |
+Config selects exactly one `mode` and its matching block:
 
-`access` lists the subjects the issuer vouches for, each `reader` or `writer`;
-empty access denies everyone. Tools read the caller with `calling_author()`,
-never from an argument; wrap them with `permitted(fn, "reader"|"writer")`.
+| Mode | Role owner | Configuration |
+|---|---|---|
+| `crocodile` | the Crocodile's caller grant | `crocodile: {url, client_id, secret_file}` |
+| `keys` | the key record | `keys: {file}` |
+| `issuer` | one role for approved clients | `issuer: {subject, role, database, approval_secret_file, ...}` |
+
+The same Crocodile authority object supplies introspection and heartbeat
+registration; there is no second credential triple or local subject list.
+The authenticated introspection answer supplies the caller's role. Positive
+answers are cached for at most60seconds (or token expiry, if sooner), so a role
+change takes effect within that bound without restarting the service.
+Missing or invalid roles refuse authentication. Keys remain live-file checks.
+An own issuer accepts only tokens it minted; modes cannot be combined.
+
+`access`, `oauth` and `pond` are refused with their replacement named.
+Tools read `calling_author()`, never an identity argument; use
+`permitted(fn, "reader"|"writer")`. Attribution remains the canonical JSON
+pair of issuer and subject, without configurable aliases.
+
+The kit's listening socket is plain HTTP. Service images declare
+`BORING_SERVICE_CONTAINER=1`; Compose owns their listener addresses in
+`BORING_SERVICE_LISTENERS`, a JSON object keyed by absolute config path:
+
+    {"/run/config/config.json":{"bind":"0.0.0.0","port":18512}}
+
+Inspection and startup read that same deployment environment. Missing addresses
+are refused, never inferred from the public URL. Container JSON refuses
+`bind`, `port` and `behind_proxy` with the Compose replacement named.
+The deploy checks actual publications: loopback, or no publications and an
+explicitly named attached proxy network. The marker declares the image's
+execution model; it does not detect or configure Docker.
+
+Native runs keep JSON listener settings and the loopback guard. A native
+non-loopback bind requires explicit `behind_proxy=true` and access restricted
+to that trusted proxy; the acknowledgement adds no TLS or firewall. Native
+runs refuse container listener settings without the image marker.
 
 How each source is configured and what an operator sees (sign-in, client
 registration, the approval page, examples for every mode):
 boring-services [CONFIGURATION](https://github.com/the-boring-crocodile/boring-services/blob/main/docs/CONFIGURATION.md).
 
-A family service instead names the Crocodile in `oauth` (its `/introspect`, the
-service's `svc_` id and secret from `boring-crocodile-admin service-add`), lists
-the Ponds it serves in `access` and names the Crocodile again in `pond`. That is
-the one way a service checks its callers: the Pond is the token's subject,
-read with `calling_author()`.
+For a family service, the installer obtains the one Crocodile authority
+credential from its registration. The public `url` still names the service
+itself; `crocodile.url` names the trusted controller.
 
 ## Using it
 
-Services depend on boring-service-kit 0.7 (it brings boring-registry) and pin the exact wheels in their lock file.
+Services depend on boring-service-kit (it brings boring-registry) and pin the exact wheels in their lock file.
 
 ```python
 from boring_service_kit.http import ServiceConfig, add_config_argument
@@ -52,12 +78,25 @@ from boring_service_kit.pond import attach_heartbeat
 
 def make_server(auth, on_discover):
     server = MCPServer("my-service", **auth)   # token check or issuer, and its settings
-    attach_heartbeat(server, on_discover)       # no-op without a pond section
+    attach_heartbeat(server, on_discover)       # no-op outside Crocodile mode
     ...  # tools, wrapped with permitted(); calling_author() names the caller
     return server
 
 ServiceConfig(args.config).serve(make_server)
 ```
+
+`ServiceConfig.validate(path)` runs the same configuration parser and SDK
+settings checks without opening or initializing an issuer database or
+starting a server. It returns `None` on success and raises the same input
+errors as startup. Referenced client secrets are read; database contents,
+write permissions and network reachability remain separate checks. Use it
+for a candidate's config check before switching the running service.
+
+`ServiceConfig.inspect(path)` performs the same read-only validation and
+returns immutable `ServiceInfo` (URL, bind, port and optional OAuth client
+ID). A running config's `info()` returns the same view. It contains no
+credentials or runnable service methods; composed servers can share their
+frontend checks between inspection and startup.
 
 Tests: `pytest packages/boring-service-kit/tests` with mcp 2.2.0 and
 boring-registry installed. `boring_service_kit.testing` has a fake control
@@ -112,3 +151,14 @@ Use private managed key-file directories, not arbitrary user documents.
 Tests: the portable key, security, concurrency and output checks run everywhere;
 two more run only on Windows (equivalent security descriptors with relocated
 fields, and a key update under inherited security).
+
+## Outcomes
+
+The classes come from [boring-outcomes](../boring-outcomes/README.md).
+Refused means nothing started or changed; Failed means work started and
+may have had effects. as_data() renders flat status, code, message and
+detail fields. Invalid codes, messages or non-JSON details are programming
+errors. There is no nested details rendering.
+
+MCP outcomes remain a single compact JSON text block with isError=true,
+without structuredContent or a generated output schema.

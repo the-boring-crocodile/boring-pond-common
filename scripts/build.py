@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGES = ("boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
+PACKAGES = ("boring-outcomes", "boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
 
 
 EPOCH = 315532800  # 1980-01-01, the earliest time a zip archive can record

@@ -11,6 +11,7 @@ All of it — code, tests, docs — was written by AI (OpenAI's models and Anthr
 
 | Package | Consumers |
 |---|---|
+| [boring-outcomes](packages/boring-outcomes/README.md) | shared causes, Refused/Failed and flat rendering for both kits and their consumers |
 | boring-registry | Crocodile, Pirates, services, pondNT |
 | boring-file-core | Crocodile, Pirates, pondNT |
 | boring-service-kit | Crocodile, services, pondNT |
@@ -22,9 +23,9 @@ Common packages must not import a host or service application.
 ## Development
 
     python scripts/check.py                 # versions, build, all tests on the built wheels
-    python scripts/check.py --python 3.10   # same on another interpreter (uv fetches it)
+    python scripts/check.py --python 3.12   # same on another interpreter (uv fetches it)
     python scripts/build.py                 # wheels + sdists into dist/, with SHA256SUMS
-    python scripts/version.py 0.7.0         # set the lockstep version everywhere
+    python scripts/version.py 0.8.0         # set the lockstep version everywhere
 
 The tools need [uv](https://docs.astral.sh/uv/) on PATH (or `UV=/path/to/uv`).
 For quick iteration, install the packages editable into a development

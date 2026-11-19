@@ -1,4 +1,4 @@
-"""A server's own OAuth authorization server (boring-service-kit 0.5.0).
+"""A server's own OAuth authorization server.
 
 - `store`: the SQLite store (grants in `records`, clients with origin and state in `clients`).
 - `clients`: the client policy (pre-registration, metadata documents, optional

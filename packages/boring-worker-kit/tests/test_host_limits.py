@@ -4,9 +4,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from boring_worker_kit.execution import prepare_command
-from boring_worker_kit.host_limits import USEC_INFINITY, read_host_limits
+from boring_worker_kit.host_limits import HostLimits, USEC_INFINITY, read_host_limits
 from boring_worker_kit.settings import EnvironmentSettings
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class HostLimitsTest(unittest.TestCase):
@@ -14,6 +14,25 @@ class HostLimitsTest(unittest.TestCase):
         return EnvironmentSettings(
             "pond", root, (root,), root / "task.sock", "acme-task-pond",
             Path("/system.slice/system-acme.slice"), 1024)
+
+    def test_caller_can_own_process_launch_without_losing_the_deadline(self):
+        for finish, expires in ((1.5, False), (3.1, True)):
+            with self.subTest(expires=expires), tempfile.TemporaryDirectory() as directory:
+                replies = iter(["2", 'o "/org/freedesktop/systemd1/unit/task_2eservice"', "t 90000000"])
+                timeouts = []
+                def run(command, *, timeout):
+                    timeouts.append(timeout)
+                    return next(replies)
+                with patch("boring_worker_kit.host_limits._run", side_effect=AssertionError("caller bypassed")), \
+                        patch("boring_worker_kit.host_limits.time.monotonic",
+                              side_effect=[0, 0, .5, .5, 1, 1, finish]):
+                    if expires:
+                        with self.assertRaisesRegex(TimeoutError, "startup budget"):
+                            read_host_limits(self.settings(Path(directory)), run=run)
+                    else:
+                        limits = read_host_limits(self.settings(Path(directory)), run=run)
+                        self.assertEqual(limits, HostLimits(2, 80))
+                self.assertEqual(timeouts, [3, 2.5, 2])
 
     def test_loaded_finite_host_policy_and_command_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -30,7 +49,7 @@ class HostLimitsTest(unittest.TestCase):
             self.assertIn("acme-task-pond.socket", run.call_args_list[0].args[0])
             self.assertEqual(prepare_command(settings, "true", None, None, limits)[1], 80)
             self.assertEqual(prepare_command(settings, "true", None, 1000, limits, is_job=True)[1], 80)
-            with self.assertRaises(Refusal):
+            with self.assertRaises(Refused):
                 prepare_command(settings, "true", None, 0, limits, is_job=True)
 
     def test_uncapped_host_reports_the_fixed_job_maximum(self):
@@ -48,7 +67,7 @@ class HostLimitsTest(unittest.TestCase):
             })
             self.assertEqual(prepare_command(settings, "true", None, None, limits, is_job=True)[1], 120)
             for zero_job in (True, False):
-                with self.assertRaises(Refusal):
+                with self.assertRaises(Refused):
                     prepare_command(settings, "true", None, 0, limits, is_job=zero_job)
 
     def test_unknown_capacity_fails_closed(self):

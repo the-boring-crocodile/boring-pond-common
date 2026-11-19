@@ -1,12 +1,13 @@
 """Read the fixed Pond units' effective limits from systemd; never change them."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import re
 import subprocess
 import time
 
-from .inputs import MAX_JOB_SECONDS
+from .validation import MAX_JOB_SECONDS
 from .settings import ExecutionSettings as EnvironmentSettings
 from .settings import valid_unit_prefix
 
@@ -44,15 +45,20 @@ def _run(args: list[str], *, timeout: float) -> str:
     return result.stdout.strip()
 
 
-def read_host_limits(settings: EnvironmentSettings) -> HostLimits:
-    """Inspect a loaded socket and an inactive template instance, without starting it."""
+def read_host_limits(settings: EnvironmentSettings, *,
+                     run: Callable[..., str] | None = None) -> HostLimits:
+    """Inspect without starting a unit; run owns launch, this function the deadline.
+
+    A privileged caller supplies its protected process launcher. Workers keep
+    the ordinary-user default. Both return stripped stdout and honor timeout.
+    """
     deadline = time.monotonic() + HOST_INSPECTION_SECONDS
 
     def inspect(args):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("host limit inspection exceeded its startup budget")
-        result = _run(args, timeout=remaining)
+        result = (run or _run)(args, timeout=remaining)
         if time.monotonic() > deadline:
             raise TimeoutError("host limit inspection exceeded its startup budget")
         return result

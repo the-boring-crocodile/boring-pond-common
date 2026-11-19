@@ -20,6 +20,30 @@ from boring_deploy import install as installing
 from test_deploy import Steps, build, deploy, env, held_deploy, snapshot  # noqa: F401  (env is a fixture)
 
 
+@pytest.mark.parametrize("directory", [False, True])
+def test_path_settings_do_not_resolve_away_input_links(tmp_path, directory):
+    target = tmp_path / "target"
+    target.mkdir() if directory else target.write_text("fixture")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=directory)
+    option = installing.Setting("input", "a staged operator input", directory=directory, file=not directory)
+    with pytest.raises(boring_deploy.Failure, match="operator input"):
+        option.check(str(link))
+
+
+def test_path_setting_preserves_the_path_for_the_shared_guard(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    seen = []
+    @contextmanager
+    def guard(path, **options):
+        seen.append((path, options))
+        yield None
+    monkeypatch.setattr(installing, "root_input", guard, raising=False)
+    option = installing.Setting("config-dir", "staged config", directory=True)
+    assert option.check(str(tmp_path)) == str(tmp_path)
+    assert seen == [(tmp_path, {"directory": True})]
+
+
 class FakeInstall:
     """Installed means: HOME/compose.yaml exists (the file install writes last)."""
 
@@ -80,6 +104,29 @@ def run(tmp, home, fake, *argv, version="1.0.0", home_name="svc"):
     return code, out.getvalue() + err.getvalue()
 
 
+@pytest.mark.parametrize("instance", [False, True])
+def test_install_help_names_the_installation_scope(instance):
+    import argparse
+    parser = argparse.ArgumentParser()
+    fake = FakeInstall()
+    if instance:
+        fake.INSTANCE = installing.Setting("name", "the instance")
+    installing.add_options(parser, fake, SimpleNamespace())
+    scope = "the named instance" if instance else "this component"
+    assert f"only when {scope} is not installed" in parser.format_help()
+    assert "only when nothing is installed yet" not in parser.format_help()
+
+
+def test_component_can_describe_retained_account_removal(env, capsys):
+    tmp, _ = env
+    fake = FakeInstall()
+    fake.DELETE_DATA_HELP = "finish retained removal; lock the account and keep every file"
+    with pytest.raises(SystemExit) as done:
+        installing.uninstall_main(docker(tmp), fake, ["--help"])
+    assert done.value.code == 0
+    assert fake.DELETE_DATA_HELP in " ".join(capsys.readouterr().out.split())
+
+
 def test_first_install_needs_install_without_a_terminal(env):
     tmp, home = env
     fake = FakeInstall()
@@ -88,7 +135,9 @@ def test_first_install_needs_install_without_a_terminal(env):
     assert fake.calls == [] and not (home / "svc").exists()
 
 
-def test_first_install_names_missing_settings(env):
+def test_first_install_names_missing_settings(env, monkeypatch):
+    from functools import partial
+    monkeypatch.setattr(installing, "root_input", partial(boring_deploy.root_input, owner=os.getuid()))
     tmp, home = env
     code, out = run(tmp, home, FakeInstall(), "--install")
     assert code == 1 and "--public-url (an https URL)" in out
@@ -97,7 +146,7 @@ def test_first_install_names_missing_settings(env):
     index = installing.Setting("index", "an index file", file=True)
     (tmp / "d365.db").write_text("")
     assert index.check(str(tmp / "d365.db")) == str((tmp / "d365.db").resolve())
-    with pytest.raises(boring_deploy.Failure, match="is not a file"):
+    with pytest.raises(boring_deploy.Failure, match="operator input.*expected file"):
         index.check(str(home))
 
 
@@ -130,8 +179,9 @@ def test_install_then_deploy_then_settings_are_refused(env):
                                        "unsafe_url_auth": True})]
     assert json.loads(boring_deploy.HOMES.read_text()) == {"thing": str(home / "svc")}
     assert_public_file(boring_deploy.HOMES)
-    assert_public_file(home / "svc" / ".env")
-    assert (home / "svc" / ".env").read_text() == "BORING_IMAGE=boring-thing:1.0.0\n"
+    assert_public_file(home / "svc" / "boring-image.env")
+    assert not (home / "svc" / ".env").exists()
+    assert (home / "svc" / "boring-image.env").read_text() == "BORING_IMAGE=boring-thing:1.0.0\n"
     assert "7 record  thing 1.0.0 is live" in out
     code, out = run(tmp, home, fake, version="1.1.0")
     assert code == 0 and "installed" in out and len(fake.calls) == 1
@@ -206,7 +256,8 @@ def test_an_install_that_stops_part_way_says_so_and_a_rerun_reuses_it(env):
     assert code == 0 and "state/ from an earlier install: reused" in out
     assert json.loads(boring_deploy.HOMES.read_text()) == {"thing": str(home / "svc")}
     assert_public_file(boring_deploy.HOMES)
-    assert_public_file(home / "svc" / ".env")
+    assert_public_file(home / "svc" / "boring-image.env")
+    assert not (home / "svc" / ".env").exists()
     assert (home / "svc" / "release" / "VERSION").read_text() == "1.0.0\n"
 
 
@@ -241,7 +292,6 @@ def test_after_uninstall_another_home_may_be_chosen(env):
     assert json.loads(boring_deploy.HOMES.read_text())["thing"] == str(home / "moved")
 
 
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 def test_release_with_install_steps_carries_uninstall(env, tmp_path):
     steps = tmp_path / "install_steps.py"
     steps.write_text("from boring_install import Setting\nSETTINGS = [Setting('config-dir', 'a directory',"

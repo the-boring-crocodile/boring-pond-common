@@ -20,10 +20,10 @@ def test_compact_is_one_line_of_json():
 
 
 def test_outcomes_in_the_ponds_shape():
-    assert Refused("not_found", "no such entry").as_dict() == \
+    assert Refused("not_found", "no such entry").as_data() == \
         {"status": "refused", "code": "not_found", "message": "no such entry"}
-    assert Failed("timeout", "ran out", batch=2).as_dict() == \
-        {"status": "failed", "code": "timeout", "message": "ran out", "details": {"batch": 2}}
+    assert Failed("timeout", "ran out", batch=2).as_data() == \
+        {"status": "failed", "code": "timeout", "message": "ran out", "batch": 2}
 
 
 def test_as_mcp_tool_turns_outcomes_into_errors_and_logs(tmp_path):
@@ -104,3 +104,26 @@ def test_a_failed_rotation_does_not_silence_the_log(tmp_path, monkeypatch):
     for _ in range(2):
         log.record("t", {}, "succeeded", None, time.monotonic(), 0)
     assert path.read_text().count('"tool":"t"') == 2
+
+
+def test_shared_classes_and_text_only_flat_failure(tmp_path):
+    import pytest
+    import boring_outcomes
+    from boring_service_kit.outcomes import Outcome
+    assert Refused is boring_outcomes.Refused and Failed is boring_outcomes.Failed
+    assert Outcome is boring_outcomes.Outcome
+    log = CallLog(tmp_path / "calls.jsonl")
+    def failing() -> dict:
+        raise Failed("timeout", "ran out", effects="unknown", retry_after_seconds=5)
+    wrapped = as_mcp_tool(failing, log)
+    result = wrapped()
+    assert result.is_error and result.structured_content is None
+    assert len(result.content) == 1
+    assert json.loads(result.content[0].text) == {
+        "status": "failed", "code": "timeout", "message": "ran out",
+        "effects": "unknown", "retry_after_seconds": 5}
+    assert wrapped.__signature__.return_annotation is type(result)
+    def broken() -> dict:
+        raise RuntimeError("unexpected")
+    with pytest.raises(RuntimeError, match="unexpected"):
+        as_mcp_tool(broken, log)()

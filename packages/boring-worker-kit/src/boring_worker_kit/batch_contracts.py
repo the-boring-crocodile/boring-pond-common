@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 from .framing import MAX_COMMAND_BYTES, MAX_FRAME_BYTES
 from .inputs import ExecTimeoutSeconds, JobTimeoutSeconds, ReceiptLimit
-from .outcomes import Refusal
+from .outcomes import Refused
 
 # A wait step is bounded by the batch's own overall ceiling, not the standalone
 # tool's 0..60 default-45 policy: the remaining batch deadline clamps it further
@@ -182,11 +182,6 @@ class JobListStep(StepBase):
     arguments: JobListArgs
 
 
-class JobStatusStep(StepBase):
-    method: Literal["job_status"]
-    arguments: JobSelectorArgs
-
-
 class JobOutputStep(StepBase):
     method: Literal["job_output"]
     arguments: JobSelectorArgs
@@ -208,7 +203,7 @@ class ServiceListStep(StepBase):
 
 
 BatchStep = Annotated[Union[ReadStep, WriteStep, PatchStep, ReadBytesStep, WriteBytesStep, ListStep, SearchStep,
-                             ExecStep, JobStartStep, JobListStep, JobStatusStep,
+                             ExecStep, JobStartStep, JobListStep,
                              JobOutputStep, JobStopStep, JobWaitStep, ServiceListStep],
                     Field(discriminator="method")]
 
@@ -236,14 +231,14 @@ def validation_fields(error: ValidationError) -> list[str]:
     return fields
 
 
-def invalid_request(error: ValidationError, message: str) -> Refusal:
-    return Refusal("invalid_request", message, fields=validation_fields(error))
+def invalid_request(error: ValidationError, message: str) -> Refused:
+    return Refused("invalid_request", message, fields=validation_fields(error))
 
 
 def admit_batch(raw: object) -> BatchRequest:
     # Limit the fully escaped input, including repeated payloads, before dispatch.
     if len(json.dumps(raw, ensure_ascii=True, allow_nan=False).encode()) > min(BATCH_INPUT_BYTES, MAX_FRAME_BYTES):
-        raise Refusal("limit", "batch input exceeds limit")
+        raise Refused("limit", "batch input exceeds limit")
     try:
         return BatchRequest.model_validate(raw)
     except ValidationError as error:

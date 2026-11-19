@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 from boring_worker_kit.execution import EnvironmentExecutor
 from boring_worker_kit.host_limits import HostLimits
 from boring_worker_kit.framing import read_frame, write_frame
@@ -198,10 +198,10 @@ class TaskClientTest(unittest.IsolatedAsyncioTestCase):
             return await asyncio.open_connection(sock=local)
 
         self.client._connect = connect
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.launch()
         self.assertEqual(caught.exception.as_data(), {
-            "code": "not_admitted",
+            "status": "refused", "code": "not_admitted",
             "message": "task runner closed the connection before dispatch; no command was started"})
         self.assertEqual(attempts, 1)
         self.assertEqual(self.requests, [])
@@ -216,11 +216,11 @@ class TaskClientTest(unittest.IsolatedAsyncioTestCase):
             return await asyncio.open_connection(sock=local)
 
         self.client._connect = connect
-        with patch.object(task_client, "GREETING_SECONDS", 0.05), self.assertRaises(Refusal) as caught:
+        with patch.object(task_client, "GREETING_SECONDS", 0.05), self.assertRaises(Refused) as caught:
             await self.launch()
         kept[0].close()
         self.assertEqual(caught.exception.as_data(), {
-            "code": "not_admitted",
+            "status": "refused", "code": "not_admitted",
             "message": "task runner did not answer within 0.05 seconds; no command was started"})
         self.assertEqual(self.requests, [])
 

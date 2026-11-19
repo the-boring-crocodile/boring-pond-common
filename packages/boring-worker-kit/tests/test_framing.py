@@ -8,7 +8,7 @@ from boring_worker_kit.execution import prepare_command
 from boring_worker_kit.framing import MAX_COMMAND_BYTES, MAX_FRAME_BYTES, MAX_OUTPUT_BYTES, read_frame, write_frame
 from boring_worker_kit.host_limits import HostLimits
 from boring_worker_kit.settings import EnvironmentSettings
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class FramingBudgetTest(unittest.IsolatedAsyncioTestCase):
@@ -35,7 +35,7 @@ class FramingBudgetTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(received["result"], result)
             self.assertLessEqual(len(json.dumps(received, separators=(",", ":")).encode()),
                                  MAX_FRAME_BYTES)
-            with self.assertRaisesRegex(Refusal, "^limit: command exceeds"):
+            with self.assertRaisesRegex(Refused, "^limit: command exceeds"):
                 prepare_command(settings, command + "x", None, 1, HostLimits(1, 90))
 
     async def test_malformed_json_contract_and_nonfinite_output(self):

@@ -52,7 +52,7 @@ class EnvironmentSettings:
 
     @classmethod
     def from_mapping(cls, raw: object) -> "EnvironmentSettings":
-        from .inputs import table, text, integer, strings
+        from .validation import table, text, integer, strings
         value = table(raw, "execution", {"name", "default_cwd", "allowed_roots", "task_socket_path",
                      "task_unit_prefix", "task_cgroup_parent"}, {"output_limit_bytes", "watch_root"})
         def path(item: object, label: str) -> Path:

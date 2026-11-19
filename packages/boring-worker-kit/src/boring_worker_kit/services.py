@@ -9,16 +9,16 @@ requests that carry a bearer token the control plane minted for this Pond and
 this service. The agent's own token never leaves the control plane.
 
 Outcomes are data: an unknown service is `not_found`, one that missed its last
-ping `unavailable`; a tool error or a JSON-RPC error from the service is a
-refusal with the service's code and message. A connection that fails after the
-request was sent is a failure: the request may have run, and it is not re-sent.
+ping `unavailable`. A valid tool outcome keeps the service's status, code,
+message and details. Other tool or JSON-RPC errors have unknown effects.
+A connection that fails after sending is a failure: the request may have run,
+and it is not re-sent.
 """
 from __future__ import annotations
 
 import asyncio
 import contextvars
 import json
-import sys
 import time
 from collections.abc import Awaitable, Callable, Generator
 from typing import Any, TypeVar, cast
@@ -32,7 +32,7 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import LATEST_MODERN_VERSION
 
 from .service_contract import SERVICE_NAME, service_ping_timeout, service_url
-from .outcomes import Refusal, is_code
+from .outcomes import Failed, Refused
 
 
 class ServiceFailure(RuntimeError):
@@ -40,11 +40,6 @@ class ServiceFailure(RuntimeError):
     def __init__(self, data: dict[str, Any]) -> None:
         self.data = data
         super().__init__(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
-
-if sys.version_info >= (3, 11):
-    from builtins import BaseExceptionGroup
-else:
-    from exceptiongroup import BaseExceptionGroup
 
 MAX_SERVICES = 32
 CALL_TIMEOUT_SECONDS = POND_CALL_SECONDS
@@ -83,12 +78,12 @@ async def _never_pinged() -> bool:
     raise RuntimeError("a transient granted entry is not part of the heartbeat")
 
 
-def _tool_refusal(result: types.CallToolResult) -> Refusal | ServiceFailure:
+def _tool_refusal(result: types.CallToolResult) -> Refused | ServiceFailure:
     """Classify a tool error without erasing failed/possibly-affected outcomes.
 
     The service states its code and message as structured content
-    `{code, message, ...}`, or as that JSON object for the text of a ToolError.
-    Any other tool error is `tool_error` with the service's text.
+    `{status, code, message, ...}`, or as that JSON object for the text of a ToolError.
+    Any other tool error is `upstream_error` with the service's text.
     """
     data: object = result.structured_content
     text = " ".join(item.text for item in result.content if isinstance(item, types.TextContent))
@@ -98,13 +93,17 @@ def _tool_refusal(result: types.CallToolResult) -> Refusal | ServiceFailure:
             data = json.loads(body)
         except ValueError:
             data = None
-    if isinstance(data, dict) and is_code(data.get("code")) and isinstance(data.get("message"), str):
-        if data.get("status") not in (None, "refused"):
-            return ServiceFailure(data)
-        extra = {key: value for key, value in data.items() if key not in ("code", "message")}
-        return Refusal(data["code"], data["message"], **extra)
-    return ServiceFailure({"status": "failed", "code": "tool_error",
-                           "message": text or "service tool error", "effects": "unknown"})
+    if isinstance(data, dict) and data.get("status") in ("refused", "failed"):
+        extra = {key: value for key, value in data.items() if key not in ("status", "code", "message")}
+        try:
+            cls = Refused if data["status"] == "refused" else Failed
+            outcome = cls(data["code"], data["message"], **extra)
+        except (KeyError, TypeError, ValueError):
+            pass  # An invalid downstream outcome is an unknown tool failure.
+        else:
+            return outcome if isinstance(outcome, Refused) else ServiceFailure(outcome.as_data())
+    return ServiceFailure(Failed("upstream_error", text or "service tool error",
+                                 effects="unknown").as_data())
 
 
 class Services:
@@ -139,19 +138,19 @@ class Services:
         """Forwarded by the control plane, which authenticated the service."""
         name, url = request.get("name"), request.get("url")
         if not isinstance(name, str) or not SERVICE_NAME.fullmatch(name) or not isinstance(url, str):
-            raise Refusal("invalid_request", "a service registers with its name and url")
+            raise Refused("invalid_request", "a service registers with its name and url")
         try:
             service_url(url)
         except ValueError as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
         timeout = request.get("ping_timeout_seconds", PING_TIMEOUT_SECONDS)
         try:
             service_ping_timeout(timeout)
         except ValueError as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
         identity = f"service/{name}"
         if self.registry.get(identity) is None and len(self.registry.list()) >= MAX_SERVICES:
-            raise Refusal("limit", "the service registry is full")
+            raise Refused("limit", "the service registry is full")
 
         async def ping() -> bool:
             await self._request(url, None, lambda client: client.session.send_discover(
@@ -164,7 +163,7 @@ class Services:
     def forget(self, name: object) -> dict[str, object]:
         """The control plane withdrew this Pond's grant: stop pinging and listing it."""
         if not isinstance(name, str) or not SERVICE_NAME.fullmatch(name):
-            raise Refusal("invalid_request", "service must be a name")
+            raise Refused("invalid_request", "service must be a name")
         return {"forgotten": self.registry.remove(f"service/{name}")}
 
     def list(self) -> dict[str, object]:
@@ -175,34 +174,34 @@ class Services:
 
     def _available(self, name: object) -> Entry:
         if not isinstance(name, str):
-            raise Refusal("invalid_request", "service must be a name")
+            raise Refused("invalid_request", "service must be a name")
         entry = self.registry.get(f"service/{name}")
         if entry is None:
-            raise Refusal("not_found", "no such service is registered with this Pond")
+            raise Refused("not_found", "no such service is registered with this Pond")
         if not entry.available:
-            raise Refusal("unavailable", f"{name} missed its last ping: {entry.last_miss}")
+            raise Refused("unavailable", f"{name} missed its last ping: {entry.last_miss}")
         return entry
 
     async def _call(self, entry: Entry, token: object, method: str,
                     send: Callable[[Client], Awaitable[_T]], timeout: float | None = None) -> _T:
         if not isinstance(token, str) or not token:
-            raise Refusal("invalid_request", "a service request needs the control plane's token")
+            raise Refused("invalid_request", "a service request needs the control plane's token")
         name, url = entry.details["name"], entry.details["url"]
         # The caller's time left (a carried deadline), never more than the service contract.
         limit = CALL_TIMEOUT_SECONDS if timeout is None else min(CALL_TIMEOUT_SECONDS, timeout)
         if limit <= 0:
-            raise Refusal("limit", f"no time left for {method} to {name}; nothing was sent")
+            raise Refused("not_admitted", f"no time left for {method} to {name}; nothing was sent")
         call: dict[str, Any] = {"token": token}
         try:
             return await asyncio.wait_for(self._request(url, call, send), limit)
         except httpx2.ConnectError:
-            raise Refusal("unavailable", f"{name} accepts no connection at {url}; "
+            raise Refused("unavailable", f"{name} accepts no connection at {url}; "
                           "nothing was sent") from None
         except MCPError as error:
             if call.get("status") in (401, 403):
-                raise Refusal("forbidden", "the service rejected the call token") from None
-            raise ServiceFailure({"status": "failed", "code": "service_error", "message": error.message,
-                                  "service_code": error.code, "effects": "unknown"}) from None
+                raise Refused("forbidden", "the service rejected the call token") from None
+            raise ServiceFailure(Failed("upstream_error", error.message,
+                                        service_code=error.code, effects="unknown").as_data()) from None
         except asyncio.TimeoutError:
             raise TimeoutError(f"{name} did not answer {method} within {limit:g} s; "
                                "the request may have run") from None
@@ -217,14 +216,14 @@ class Services:
         from model arguments. URL validation and downstream handling stay here.
         """
         if grant.get("name") != name:
-            raise Refusal("forbidden", "grant names another service")
+            raise Refused("forbidden", "grant names another service")
         url = grant.get("url")
         if not isinstance(name, str) or not SERVICE_NAME.fullmatch(name) or not isinstance(url, str):
-            raise Refusal("invalid_request", "a grant names a service and its url")
+            raise Refused("invalid_request", "a grant names a service and its url")
         try:
             service_url(url)
         except ValueError as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
         # A transient entry for this call only: the shared heartbeat registry
         # (its liveness, misses and capacity) stays the heartbeat's own.
         now = time.monotonic()
@@ -243,13 +242,13 @@ class Services:
                    grant: dict[str, object] | None = None, timeout: float | None = None) -> dict[str, object]:
         """One MCP tools/call; the service owns the tool's argument validation. `timeout`:
         the caller's time left, capped by CALL_TIMEOUT_SECONDS; zero or less is refused
-        (`limit`) before anything is sent. A timeout or broken connection after sending
+        (`not_admitted`) before anything is sent. A timeout or broken connection after sending
         raises (the call may have run); the service's own refusal comes back with its code."""
         entry = self._granted(name, grant) if grant is not None else self._available(name)
         if not isinstance(tool, str) or not tool:
-            raise Refusal("invalid_request", "tool must be a nonempty name")
+            raise Refused("invalid_request", "tool must be a nonempty name")
         if not isinstance(arguments, dict):
-            raise Refusal("invalid_request", "arguments must be an object")
+            raise Refused("invalid_request", "arguments must be an object")
         request = types.CallToolRequest(params=types.CallToolRequestParams(name=tool, arguments=arguments))
         result = await self._call(entry, token, "tools/call", lambda client: client.session.send_request(
             request, types.CallToolResult), timeout)
@@ -274,7 +273,7 @@ class Services:
             return await self.describe(request["service"], request["token"])
         if operation == "service_call" and keys == {"operation", "service", "tool", "arguments", "token"}:
             return await self.call(request["service"], request["tool"], request["arguments"], request["token"])
-        raise Refusal("invalid_request", "invalid service worker envelope")
+        raise Refused("invalid_request", "invalid service worker envelope")
 
     async def close(self) -> None:
         await self.http.aclose()

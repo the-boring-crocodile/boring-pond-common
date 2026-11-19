@@ -25,6 +25,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+from . import LINUX_GLIBC_FLOOR
+
 ENGINE = Path(__file__).with_name("__init__.py")
 INSTALLER = Path(__file__).with_name("install.py")
 LICENCE_FILES = ("LICENSE", "COPYING.md")
@@ -34,9 +36,9 @@ PYTHON_NOTICES = Path(__file__).with_name("python_notices")
 _START = '''import os
 import sys
 
-# The engine and the steps need 3.11 (tomllib, among others): refused here, before they are imported.
-if sys.version_info < (3, 11):
-    sys.exit("python3 3.11 or newer is needed to run this; this is python3 %d.%d" % tuple(sys.version_info[:2]))
+# The family requires 3.12: refuse here, before importing the engine or steps.
+if sys.version_info < (3, 12):
+    sys.exit("python3 3.12 or newer is needed to run this; this is python3 %d.%d" % tuple(sys.version_info[:2]))
 # Isolated (-I) and without bytecode (-B): the release stays as its manifest lists it.
 if not (sys.flags.isolated and sys.flags.dont_write_bytecode):
     os.execv(sys.executable, [sys.executable, "-I", "-B", os.path.abspath(__file__), *sys.argv[1:]])
@@ -75,6 +77,12 @@ def assemble(out: Path, release: dict[str, object], steps: Path, files: dict[str
     missing = [n for n in LICENCE_FILES if n not in files]
     if missing:
         raise SystemExit(f"a release carries the component's licence: files lacks {', '.join(missing)}")
+    # All artifacts target x86_64; only the venv runtime uses the host libc.
+    release = {**release, "architecture": "x86_64"}
+    if release["runtime"] == "venv":
+        release["glibc_min"] = ".".join(map(str, LINUX_GLIBC_FLOOR))
+    else:
+        release.pop("glibc_min", None)
     name = f"{release['component']}-{release['version']}"
     root = out / name
     if root.exists():

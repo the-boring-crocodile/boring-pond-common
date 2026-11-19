@@ -21,12 +21,12 @@ refuses). Steps, stopping at the first failure:
   -  backup    only when the data generation changes (asked, or the flag)
   4. switch    venv: previous <- current, current <- new, restart the units
                that run (a stopped unit stays stopped);
-               docker: .env BORING_IMAGE <- new image, compose up -d (an
+               docker: boring-image.env BORING_IMAGE <- new image, compose up -d (an
                update leaves a stopped stack stopped; a first install starts it;
                only the compose services units(ctx) names, else the whole stack)
   5. start     wait until running (nothing to wait for when all were stopped)
   6. smoke     the component's own end-to-end check (skipped when stopped)
-  7. record    append to HOME/DEPLOYED, print the rollback command
+  7. record    append to HOME/DEPLOYED, print the component's way back
 
 Steps 0-3 do not change what runs; step 2 writes the new release into HOME
 beside the running one (and builds its image), and an approved first install
@@ -41,10 +41,15 @@ check(ctx), smoke(ctx), units(ctx) -> [unit, ...] (venv: the units an update
 restarts when they run; docker: the compose services the deploy owns, started
 and waited for, the whole stack when none are named), healthy(ctx) -> bool | None (the running release
 passes its own checks, asked before the switch; a healthy one always becomes
-previous), data_generation(ctx) -> int | None, backup(ctx, directory) -> Path,
+previous), preflight(ctx) -> list[str] (read-only problems before any install),
+data_generation(ctx) -> int | None, backup(ctx, directory) -> Path,
+way_back(ctx, previous) -> str | None (read-only recovery guidance for the
+retained release; None keeps its normal deploy command),
+completion(ctx) -> str | None (read-only completion wording after success;
+None keeps the normal live/stopped message; it never skips start or smoke),
 lock(ctx) -> a context manager held from step 1 to the record (a component's
 own lock, taken after the operation lock: see the README's lock order).
-Standard library only: it runs on the host's python3 (3.11 or newer; the
+Standard library only: it runs on the host's python3 (3.12 or newer; the
 launcher refuses older) before anything is installed.
 """
 from __future__ import annotations
@@ -54,11 +59,14 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import grp
 import json
 import os
+import platform
 import pwd
 import re
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -66,11 +74,13 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 HOMES = Path("/etc/boring-pond/homes.json")
 LOCKS = Path("/run/boring-pond")  # root's: the operation locks and homes.lock (gone at reboot, as are the holders)
 GENERATED = {"app", "bin", "__pycache__"}  # made by prepare in a venv release directory
+# The supported host floor of the Linux x86_64 artifacts we build.
+LINUX_GLIBC_FLOOR = (2, 39)
 WAIT_SECONDS = 120
 COMPLETE = ".installed"  # app/ is used only once this marker exists
 
@@ -79,6 +89,237 @@ class Failure(Exception):
     def __init__(self, message: str, hint: str = ""):
         super().__init__(message)
         self.hint = hint
+
+
+@dataclass(frozen=True)
+class AccountIdentity:
+    """NSS-assigned IDs retained by the component to detect account replacement."""
+    uid: int
+    gid: int
+
+    def __post_init__(self) -> None:
+        if type(self.uid) is not int or type(self.gid) is not int or min(self.uid, self.gid) <= 0:
+            raise Failure("restricted account identity needs positive uid and gid")
+
+
+def system_account(name: str, home: Path, comment: str,
+                   expected: AccountIdentity | None = None) -> AccountIdentity:
+    """Observe one restricted identity; this does not authorize adopting it.
+
+    The component owns whether an existing account belongs to its installation.
+    Pass its retained IDs on later operations. No shadow/password data is read.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name) or not home.is_absolute():
+        raise Failure("restricted account needs a safe name and absolute home")
+    try:
+        user, group = pwd.getpwnam(name), grp.getgrnam(name)
+    except KeyError:
+        raise Failure(f"restricted account {name}: identity not observed") from None
+    identity = AccountIdentity(user.pw_uid, user.pw_gid)
+    if (user.pw_name != name or user.pw_dir != str(home) or user.pw_shell != "/usr/sbin/nologin"
+            or user.pw_gecos != comment or group.gr_name != name or group.gr_gid != identity.gid
+            or set(os.getgrouplist(name, identity.gid)) != {identity.gid}
+            or set(group.gr_mem) - {name}
+            or any(other.pw_gid == identity.gid and other.pw_name != name for other in pwd.getpwall())
+            or (expected is not None and identity != expected)):
+        raise Failure(f"restricted account {name}: identity or membership changed; retained")
+    return identity
+
+
+def create_system_account(name: str, home: Path, comment: str,
+                          run: Callable[..., Any]) -> AccountIdentity:
+    """Create a fresh system identity with private group and no login shell.
+
+    Never adopts names or paths. The component creates its own directories after
+    observing the assigned IDs; no home, group or account is ever deleted here.
+    run is the deployment Context's checked child runner.
+    """
+    if (not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name) or not home.is_absolute()
+            or not isinstance(comment, str) or not comment or any(c in comment for c in "\n\r:\0")):
+        raise Failure("restricted account needs a safe name, absolute home and comment")
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        try:
+            lookup(name)
+        except KeyError:
+            continue
+        raise Failure(f"restricted account {name}: name already exists; not adopted")
+    if os.path.lexists(home):
+        raise Failure(f"restricted account {name}: home already exists; retained")
+    run("useradd", "--system", "--user-group", "--no-create-home",
+        "--home-dir", str(home), "--shell", "/usr/sbin/nologin", "--comment", comment, name)
+    return system_account(name, home, comment)
+
+
+def lock_system_account(name: str, home: Path, comment: str, expected: AccountIdentity,
+                        run: Callable[..., Any]) -> None:
+    """Recheck identity, then lock password and expire the account; keep all files.
+
+    Expiry is needed because password locking alone does not revoke public keys.
+    This does not stop existing sessions. The component owns SSH key revocation
+    and checking that its tunnel has closed before removing service grants.
+    """
+    if not isinstance(expected, AccountIdentity):
+        raise Failure("locking a restricted account needs its retained identity")
+    system_account(name, home, comment, expected)
+    run("usermod", "--lock", "--expiredate", "1970-01-02", name)
+
+
+# Root children use the host's tool directories, never the operator's PATH.
+SYSTEM_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_PYTHON_PROGRAM = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)?)?")
+
+
+def _root_argv(command: Sequence[str | os.PathLike[str]]) -> list[str]:
+    if not command:
+        raise Failure("a root child needs an executable")
+    program, *arguments = map(os.fspath, command)
+    if not os.path.isabs(program):
+        if "/" in program:
+            raise Failure("root child executable must be absolute: " + program)
+        found = shutil.which(program, path=SYSTEM_TOOL_PATH)
+        if found is None:
+            raise Failure("host tool not found in system directories: " + program)
+        program = found
+    if _PYTHON_PROGRAM.fullmatch(Path(program).name):
+        while arguments and arguments[0] in {"-I", "-B"}:
+            arguments.pop(0)
+        return [program, "-I", "-B", *arguments]
+    # Console scripts are Python children too. Isolate their interpreter rather
+    # than trusting PYTHONPATH just because the script path is absolute.
+    try:
+        with open(program, "rb") as source:
+            first = source.readline(4096)
+    except OSError:
+        first = b""  # the process launcher reports a missing/unreadable executable
+    if first.startswith(b"#!"):
+        interpreter = shlex.split(first[2:].decode("utf-8").strip())
+        if interpreter and Path(interpreter[0]).name == "env":
+            interpreter = interpreter[1:]
+            if interpreter[:1] == ["-S"]:
+                interpreter = interpreter[1:]
+        if interpreter and _PYTHON_PROGRAM.fullmatch(Path(interpreter[0]).name):
+            return _root_argv([*interpreter, program, *arguments])
+    return [program, *arguments]
+
+
+def root_child(command: Sequence[str | os.PathLike[str]], *, user: str | None = None,
+               spawn: Callable[..., Any] | None = None, **options: Any) -> Any:
+    """Launch a root-controlled child with isolated Python, system tools and cwd /.
+
+    The caller owns capture, deadlines and cleanup. Pass subprocess.Popen as
+    spawn when that owner needs a process handle instead of a completed result.
+    A user switch wraps the already-normalized child, not the other way round.
+    """
+    if Path(options.pop("cwd", "/")) != Path("/"):
+        raise Failure("root child working directory must be /")
+    arguments = _root_argv(command)
+    if user is not None:
+        runuser = _root_argv(["runuser"])
+        arguments = [*runuser, "-u", user, "--", *arguments]
+    environment = {**os.environ, **(options.pop("env", None) or {})}
+    environment["PATH"] = SYSTEM_TOOL_PATH
+    return (spawn or subprocess.run)(arguments, cwd="/", env=environment, **options)
+
+
+def _input_info(fd: int, path: Path, owner: int, *, ancestor: bool = False) -> dict[str, Any]:
+    info = os.fstat(fd)
+    directory = stat.S_ISDIR(info.st_mode)
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise Failure(f"unsafe operator input {path}: needs a regular file or directory")
+    if info.st_uid not in ({0, owner} if ancestor else {owner}):
+        raise Failure(f"unsafe operator input {path}: owner uid {info.st_uid}, expected {owner}")
+    # A root-owned sticky ancestor (e.g. /tmp) cannot replace a root-owned child.
+    sticky_parent = ancestor and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if info.st_mode & 0o022 and not sticky_parent:
+        raise Failure(f"unsafe operator input {path}: mode {stat.S_IMODE(info.st_mode):04o} permits another writer")
+    if not directory and info.st_nlink > 1:
+        raise Failure(f"unsafe operator input {path}: multiple hard links")
+    return dict(path=str(path), uid=info.st_uid, gid=info.st_gid,
+                mode=stat.S_IMODE(info.st_mode), kind="directory" if directory else "file")
+
+
+@dataclass
+class RootInput:
+    """An opened operator input. Metadata never includes its content."""
+    path: Path
+    fd: int = field(repr=False)
+    owner: int = field(repr=False)
+    metadata: list[dict[str, Any]]
+
+    def describe(self) -> list[str]:
+        return [f"operator input {row['path']}: uid {row['uid']}, gid {row['gid']}, mode {row['mode']:04o}"
+                for row in self.metadata]
+
+    def _source(self):
+        info = _input_info(self.fd, self.path, self.owner)
+        if info["kind"] != "file":
+            raise Failure(f"operator input {self.path}: cannot read a directory as a file")
+        stream = os.fdopen(os.dup(self.fd), "rb")
+        stream.seek(0)
+        return stream
+
+    def read_bytes(self) -> bytes:
+        with self._source() as stream:
+            return stream.read()
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        return self.read_bytes().decode(encoding)
+
+    def copy_to(self, target: Path) -> None:
+        with self._source() as source:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+@contextlib.contextmanager
+def root_input(path: Path | str, *, directory: bool = False, owner: int = 0) -> Iterator[RootInput]:
+    """Open a root-owned input without following any component or tree symlink.
+
+    owner permits synthetic ordinary-user test trees; root installers keep 0.
+    The opened descriptor remains the read/copy source until the context ends.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        raise Failure(f"operator input {path}: use an absolute path")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    with contextlib.ExitStack() as opened:
+        def acquire(name, *, parent=None, is_directory=False):
+            fd = os.open(name, flags | (os.O_DIRECTORY if is_directory else 0), dir_fd=parent)
+            opened.callback(os.close, fd)
+            return fd
+        try:
+            fd = acquire("/", is_directory=True)
+            current = Path("/")
+            _input_info(fd, current, owner, ancestor=True)
+            for index, name in enumerate(path.parts[1:]):
+                last = index == len(path.parts) - 2
+                current = current / name
+                fd = acquire(name, parent=fd, is_directory=not last or directory)
+                _input_info(fd, current, owner, ancestor=not last)
+            metadata = [_input_info(fd, path, owner)]
+            if (metadata[0]["kind"] == "directory") != directory:
+                raise Failure(f"operator input {path}: expected {'directory' if directory else 'file'}")
+            def scan(parent, folder):
+                for name in sorted(os.listdir(parent)):
+                    child = folder / name
+                    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise Failure(f"unsafe operator input {child}: links and special files are refused")
+                    child_fd = os.open(name, flags | (os.O_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0),
+                                       dir_fd=parent)
+                    try:
+                        row = _input_info(child_fd, child, owner)
+                        metadata.append(row)
+                        if row["kind"] == "directory":
+                            scan(child_fd, child)
+                    finally:
+                        os.close(child_fd)
+            if directory:
+                scan(fd, path)
+        except OSError as error:
+            raise Failure(f"unsafe operator input {current}: {error.strerror}") from error
+        yield RootInput(path, fd, owner, metadata)
 
 
 @dataclass
@@ -92,16 +333,25 @@ class Release:
     data_generation: int | None = None
     upgrades_from: int | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    glibc_min: str | None = None
+    architecture: str | None = None
 
     @classmethod
     def load(cls, directory: Path) -> "Release":
         raw = json.loads((directory / "RELEASE.json").read_text())
-        known = {"component", "version", "runtime", "default_home", "requires", "data_generation", "upgrades_from"}
-        if raw.get("runtime") not in ("venv", "docker"):
-            raise Failure("RELEASE.json: runtime must be venv or docker")
+        known = {"component", "version", "runtime", "default_home", "requires", "data_generation", "upgrades_from", "glibc_min",
+                 "architecture"}
+        floor = raw.get("glibc_min")
+        if "glibc_min" in raw and (not isinstance(floor, str) or not re.fullmatch(r"[0-9]+\.[0-9]+", floor)):
+            raise Failure("RELEASE.json: glibc_min must be a major.minor version string")
+        architecture = raw.get("architecture")
+        if "architecture" in raw and (not isinstance(architecture, str) or not architecture):
+            raise Failure("RELEASE.json: architecture must be a non-empty string")
+        if raw.get("runtime") not in ("venv", "docker", "files"):
+            raise Failure("RELEASE.json: runtime must be venv, docker or files")
         return cls(directory, raw["component"], raw["version"], raw["runtime"], raw["default_home"],
                    dict(raw.get("requires", {})), raw.get("data_generation"), raw.get("upgrades_from"),
-                   {k: v for k, v in raw.items() if k not in known})
+                   {k: v for k, v in raw.items() if k not in known}, floor, architecture)
 
 
 @dataclass
@@ -131,11 +381,8 @@ class Context:
         terminal. A child that inherits a terminal's stdin can block forever:
         `docker compose run` keeps stdin attached and, run from an interactive
         shell, was stopped by the terminal (SIGTTIN)."""
-        if user is not None:
-            command = ("runuser", "-u", user, "--", *command)
-        result = subprocess.run(command, text=True, capture_output=capture,
-                                stdin=None if interactive else subprocess.DEVNULL,
-                                env=None if env is None else {**os.environ, **env})
+        result = root_child(command, user=user, text=True, capture_output=capture,
+                            stdin=None if interactive else subprocess.DEVNULL, env=env)
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip().splitlines()[-5:] if capture else []
             raise Failure(f"{' '.join(command)} exited {result.returncode}" + "".join("\n  " + l for l in detail))
@@ -169,7 +416,7 @@ def satisfies(version: str, spec: str) -> bool:
 # -- runtimes ----------------------------------------------------------------
 
 def installed_version(home: Path, runtime: str) -> str | None:
-    marker = home / ("current" if runtime == "venv" else "release") / "VERSION"
+    marker = home / ("release" if runtime == "docker" else "current") / "VERSION"
     return marker.read_text().strip() if marker.is_file() else None
 
 
@@ -302,7 +549,7 @@ class Venv:
     def check_host(self, ctx: Context) -> None:
         """Step 1, read-only: what the switch needs on the host (nothing more here)."""
 
-    def prepare(self, ctx: Context) -> None:
+    def _prepare_files(self, ctx: Context) -> Path:
         release = ctx.release
         target = ctx.home / "releases" / release.version
         if release.directory.resolve() != target.resolve():
@@ -323,8 +570,19 @@ class Venv:
                 readable_by_all(partial)
                 partial.rename(target)
         ctx.new = target
+        return target
+
+    def prepare(self, ctx: Context) -> None:
+        target = self._prepare_files(ctx)
         if not (target / "app" / COMPLETE).exists():
             install_app(ctx, target)
+        else:
+            link = target / "bin"
+            if not os.path.lexists(link):
+                link.symlink_to("app/bin")  # Repair the old marker-before-link interruption.
+            elif not link.is_symlink() or os.readlink(link) != "app/bin":
+                raise Failure(f"{target}: completed runtime has an unexpected bin link",
+                              "inspect the release before retrying; bin must link to app/bin")
         ctx.log(f"prepared {target}")
 
     def switch(self, ctx: Context, units: list[str]) -> None:
@@ -364,6 +622,14 @@ class Venv:
 
 
 
+class Files(Venv):
+    """Configuration-only releases: verified code, no application runtime or daemon."""
+    START = "configuration only; no application to start"
+
+    def prepare(self, ctx: Context) -> None:
+        ctx.log(f"prepared {self._prepare_files(ctx)} (configuration only)")
+
+
 def readable_by_all(root: Path) -> None:
     """The services run as their own accounts, not root: every directory and
     executable 0755, every other file 0644. copytree keeps the source's modes,
@@ -382,7 +648,7 @@ def install_app(ctx: Context, target: Path) -> None:
     app = target / "app"
     shutil.rmtree(app, ignore_errors=True)
     with tempfile.TemporaryDirectory(dir=target) as tmp:
-        shutil.unpack_archive(target / details["python"], tmp)
+        shutil.unpack_archive(target / details["python"], tmp, filter="data")
         (top,) = Path(tmp).iterdir()  # python-build-standalone: one top directory
         top.rename(app)
     python = str(app / "bin" / "python3")
@@ -397,15 +663,15 @@ def install_app(ctx: Context, target: Path) -> None:
     ctx.run(python, "-I", "-c", "import compileall, sys, sysconfig; "
             "sys.exit(not compileall.compile_dir(sysconfig.get_path('purelib'), quiet=1, workers=0))")
     readable_by_all(app)
-    (app / COMPLETE).write_text(ctx.release.version + "\n")
     link = target / "bin"
     if link.is_symlink() or link.exists():
         link.unlink()
     link.symlink_to("app/bin")
+    (app / COMPLETE).write_text(ctx.release.version + "\n")  # Publish completion last.
 
 
 class Docker:
-    """HOME/compose.yaml (the operator's, image: ${BORING_IMAGE}), HOME/.env,
+    """HOME/compose.yaml (the operator's, image: ${BORING_IMAGE}), HOME/boring-image.env,
     HOME/release/ and HOME/release.previous/.
 
     `units` are compose service names: the part of the stack this component's
@@ -415,11 +681,10 @@ class Docker:
     neither started nor waited for. No units: the whole stack, as before.
     check_units refuses, before the switch, a name that is not a service of the
     stack and an unnamed service that uses ${BORING_IMAGE} (it would keep the old
-    image while .env names the new one). The wait covers the named services
+    image while boring-image.env names the new one). The wait covers the named services
     only, not their `depends_on`."""
     MARKER = "boring-deploy-marker:units"  # stands for ${BORING_IMAGE} when the stack is rendered
     PREVIOUS = "release.previous"
-    START = "start it with docker compose -f HOME/compose.yaml up -d"
 
     def check_host(self, ctx: Context) -> None:
         """Step 1, read-only: the operator's compose.yaml names its image as the deploy sets it."""
@@ -430,6 +695,13 @@ class Docker:
 
     def prepare(self, ctx: Context) -> None:
         release, home = ctx.release, ctx.home
+        # A tag is immutable even when the retained copy is the rollback target.
+        for retained in (home / "release", home / "release.previous"):
+            if (retained / "VERSION").is_file() and (retained / "VERSION").read_text().strip() == release.version:
+                if (retained / "MANIFEST.sha256").read_bytes() != (release.directory / "MANIFEST.sha256").read_bytes():
+                    raise Failure(f"{retained} holds version {release.version} with different files",
+                                  "a version is never rebuilt: tag a new one")
+                verify_files(retained)
         new = home / "release.new"
         shutil.rmtree(new, ignore_errors=True)
         # Fresh mtimes (shutil.copy: content and mode, not times). The release's
@@ -446,7 +718,7 @@ class Docker:
 
     def compose(self, ctx: Context, *args: str, image: str | None = None, **kw: Any) -> subprocess.CompletedProcess[str]:
         env = {"BORING_IMAGE": image} if image else None
-        return ctx.run("docker", "compose", "-f", str(ctx.home / "compose.yaml"), *args, env=env, **kw)
+        return ctx.run(*compose_command(ctx.home, *args), env=env, **kw)
 
     def check_units(self, ctx: Context, units: list[str]) -> None:
         """Step 4, before the switch writes anything: the named services exist,
@@ -463,7 +735,7 @@ class Docker:
                          if isinstance(service, dict) and service.get("image") == self.MARKER and name not in units)
         if sharing:
             raise Failure(f"{', '.join(sharing)} also use ${{BORING_IMAGE}} but the deploy starts only "
-                          f"{', '.join(units)}: they would keep the old image while .env names the new one",
+                          f"{', '.join(units)}: they would keep the old image while boring-image.env names the new one",
                           "name them in the component's units, or give them an image of their own")
 
     def ps(self, ctx: Context, check: bool = False, services: tuple[str, ...] | list[str] = ()) -> list[dict[str, Any]]:
@@ -485,16 +757,18 @@ class Docker:
         return any(r.get("State") in ("running", "restarting") for r in self.ps(ctx, check=True, services=services))
 
     def switch(self, ctx: Context, units: list[str]) -> None:
-        """The new image goes into .env either way. An update leaves a stopped
+        """The new image goes into boring-image.env either way. An update leaves a stopped
         stack stopped, as the venv runtime leaves a stopped unit: no `compose
         up`, so the next start runs the new image. A first install (nothing
         installed) starts it. Decided before anything changes."""
         home = ctx.home
         assert ctx.new is not None and ctx.image is not None
         ctx.not_started = ctx.installed is not None and not self.running(ctx, units)
-        write_env(home / ".env", "BORING_IMAGE", ctx.image)
+        replace_public(home / IMAGE_ENV, f"BORING_IMAGE={ctx.image}\n")
+        migrate_image_env(home / ".env")
         if (home / "release").exists():
-            if worth_keeping(home, home / "release", ctx.running_healthy):
+            same_version = (home / "release" / "VERSION").read_text().strip() == ctx.release.version
+            if not same_version and worth_keeping(home, home / "release", ctx.running_healthy):
                 shutil.rmtree(home / "release.previous", ignore_errors=True)
                 (home / "release").rename(home / "release.previous")
             else:
@@ -543,10 +817,50 @@ def replace_public(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def write_env(path: Path, key: str, value: str) -> None:
-    lines = path.read_text().splitlines() if path.exists() else []
-    lines = [line for line in lines if not line.startswith(key + "=")] + [f"{key}={value}"]
-    replace_public(path, "\n".join(lines) + "\n")
+IMAGE_ENV = "boring-image.env"
+
+
+def compose_command(home: Path, *args: str) -> list[str]:
+    """Compose interpolation: retain the operator's values, then our image."""
+    command = ["docker", "compose", "-f", str(home / "compose.yaml")]
+    if (home / IMAGE_ENV).exists():
+        for path in (home / ".env", home / IMAGE_ENV):
+            if path.exists():
+                command += ["--env-file", str(path)]
+    return [*command, *args]
+
+
+def migrate_image_env(path: Path) -> None:
+    """Remove only the line older deploys owned; keep bytes, mode and owner."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise Failure(f"{path} is not a regular operator env file")
+        original = source.read()
+    updated = b"".join(line for line in original.splitlines(keepends=True)
+                       if not line.startswith(b"BORING_IMAGE="))
+    if updated == original:
+        return
+    fd, temporary = tempfile.mkstemp(prefix=".boring-env-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            # fchown may clear mode bits; restore the exact mode afterwards.
+            current = os.fstat(target.fileno())
+            if (current.st_uid, current.st_gid) != (info.st_uid, info.st_gid):
+                os.fchown(target.fileno(), info.st_uid, info.st_gid)
+            os.fchmod(target.fileno(), stat.S_IMODE(info.st_mode))
+            target.write(updated)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
 
 
 def rollback_hint(runtime: Any, home: Path, live: str) -> str | None:
@@ -558,7 +872,7 @@ def rollback_hint(runtime: Any, home: Path, live: str) -> str | None:
     return f"back to {marker.read_text().strip()}: sudo {previous}/deploy {home}"
 
 
-RUNTIMES: dict[str, Any] = {"venv": Venv, "docker": Docker}
+RUNTIMES: dict[str, Any] = {"venv": Venv, "docker": Docker, "files": Files}
 
 
 # -- steps -------------------------------------------------------------------
@@ -601,24 +915,87 @@ def verify_files(directory: Path) -> None:
             raise Failure(f"{name} does not match MANIFEST.sha256")
 
 
+def check_home_path(home: Path, *, missing_ok: bool = False) -> None:
+    """Check only HOME and its ancestry. Components own the data inside it."""
+    if not home.is_absolute() or home == Path("/") or ".." in home.parts:
+        raise Failure(f"{home}: choose an absolute component HOME below /")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    owner = os.geteuid()
+    current = Path("/")
+    with contextlib.ExitStack() as opened:
+        try:
+            fd = os.open("/", flags)
+            opened.callback(os.close, fd)
+            _input_info(fd, current, owner, ancestor=True)
+            for part in home.parts[1:]:
+                parent = fd
+                current = current / part
+                try:
+                    fd = os.open(part, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    if missing_ok:
+                        # An installer may create this entry. A writable parent
+                        # could let another account claim the name beforehand.
+                        _input_info(parent, current.parent, owner)
+                        return
+                    raise Failure(f"{home} does not exist", "install the component first") from None
+                opened.callback(os.close, fd)
+                _input_info(fd, current, owner, ancestor=current != home)
+        except OSError as error:
+            raise Failure(f"unsafe component HOME {current}: {error.strerror}") from error
+
+
 def check_home(release: Release, home: Path) -> None:
-    owner = home / "COMPONENT"
-    if not home.is_dir():
-        raise Failure(f"{home} does not exist", "install the component first")
-    if owner.exists() and owner.read_text().strip() != release.component:
-        raise Failure(f"{home} belongs to {owner.read_text().strip()}, not {release.component}")
+    check_home_path(home)
+    marker = home / "COMPONENT"
+    if os.path.lexists(marker):
+        with root_input(marker, owner=os.geteuid()) as source:
+            component = source.read_text().strip()
+        if component != release.component:
+            raise Failure(f"{home} belongs to {component}, not {release.component}")
 
 
 def check_requires(release: Release) -> None:
-    known = homes()
+    # Shared by --check and deploy, before an install's step zero can mutate the host.
+    # Old artifacts omit the requirement and retain their original behavior.
+    if release.architecture is not None:
+        host = platform.machine().lower()
+        aliases = {"amd64": "x86_64", "arm64": "aarch64"}
+        if aliases.get(host, host) != aliases.get(release.architecture.lower(), release.architecture.lower()):
+            raise Failure(f"artifact architecture is {release.architecture}; host architecture is {host or 'unknown'}")
+    if release.glibc_min is not None:
+        try:
+            libc = os.confstr("CS_GNU_LIBC_VERSION")
+        except (OSError, ValueError):
+            libc = None
+        match = re.fullmatch(r"glibc ([0-9]+)\.([0-9]+)", libc or "")
+        if match is None:
+            raise Failure(f"needs glibc {release.glibc_min} or newer; host glibc version is unknown")
+        actual = tuple(int(part) for part in match.groups())
+        wanted = tuple(int(part) for part in release.glibc_min.split("."))
+        if actual < wanted:
+            raise Failure(f"needs glibc {release.glibc_min} or newer; host has glibc {'.'.join(match.groups())}")
     for component, spec in release.requires.items():
-        home = Path(known.get(component, f"/opt/{component}"))
-        version = installed_version(home, "venv") or installed_version(home, "docker")
-        if version is None:
-            raise Failure(f"needs {component} {spec}; none found in {home}",
-                          "" if component in known else f"record its HOME in {HOMES}")
-        if not satisfies(version, spec):
-            raise Failure(f"needs {component} {spec}; {home} has {version}", f"deploy {component} first")
+        check_dependency(component, spec)
+
+
+def check_dependency(component: str, spec: str, *, optional: bool = False) -> None:
+    """Check one installed component, read-only; optional allows an absent peer.
+
+    A recorded HOME with no readable version remains an error, not an absent
+    optional install. The caller owns when a peer must be compatible.
+    """
+    known = homes()
+    home = Path(known.get(component, f"/opt/{component}"))
+    version = installed_version(home, "venv") or installed_version(home, "docker")
+    if version is None:
+        if optional and component not in known and not any(
+                os.path.lexists(home / name) for name in ("current", "release")):
+            return
+        raise Failure(f"needs {component} {spec}; none found in {home}",
+                      "" if component in known else f"record its HOME in {HOMES}")
+    if not satisfies(version, spec):
+        raise Failure(f"needs {component} {spec}; {home} has {version}", f"deploy {component} first")
 
 
 def data_changes(release: Release, current: int | None) -> bool:
@@ -693,10 +1070,18 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
     def hook(name: str, *extra: Any, default: Any = None) -> Any:
         return getattr(steps, name)(ctx, *extra) if hasattr(steps, name) else default
 
+    def way_back() -> str | None:
+        hint = rollback_hint(runtime, home, release.version)
+        if hint is None:
+            return None
+        own = hook("way_back", home / runtime.PREVIOUS)
+        return hint if own is None else own
+
     step, switched = "lock", False
     try:
         if os.geteuid() != 0 and not os.environ.get("BORING_DEPLOY_TEST"):
             raise Failure("run as root (sudo)")
+        check_home_path(home, missing_ok=True)
         with contextlib.ExitStack() as held:
             # Before any state a decision depends on is read; held to the record.
             held.enter_context(operation_lock(home, shared=args.check))
@@ -707,6 +1092,14 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
             # Verified before anything else, including an install's step zero.
             verify(release)
             check_requires(release)
+            problems = hook("preflight", default=[])
+            if not isinstance(problems, list) or any(not isinstance(line, str) for line in problems):
+                raise Failure("preflight must return a list of problem strings")
+            if problems:
+                for line in problems:
+                    ctx.log(line)
+                raise Failure(f"{len(problems)} preflight problem{'s' if len(problems) != 1 else ''}; nothing is changed",
+                              "resolve the listed problems as the release\'s CHANGELOG Upgrade notes say, then run deploy --check again")
             if installer is not None:
                 step = "install"
                 if not installer.step_zero(ctx, install, args):
@@ -762,10 +1155,13 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
             step = "record"
             older = ctx.installed and version_key(release.version) < version_key(ctx.installed)
             record(ctx, "rollback" if older else "deploy")
-            print(f"7 record  {release.component} {release.version} is "
-                  + (f"installed, not started ({runtime.START.replace('HOME', str(home))})" if stopped
-                     else "live"), flush=True)
-            hint = rollback_hint(runtime, home, release.version)
+            start_hint = ("start it with " + shlex.join(compose_command(home, "up", "-d"))
+                          if release.runtime == "docker" else runtime.START)
+            completion = hook("completion")
+            print(f"7 record  {release.component} {release.version} "
+                  + (completion if completion is not None else
+                     f"is installed, not started ({start_hint})" if stopped else "is live"), flush=True)
+            hint = way_back()
             if hint:
                 print(f"  {hint}")
             return 0
@@ -781,8 +1177,16 @@ def main(directory: str | Path, steps: Any, argv: list[str] | None = None, insta
                   file=sys.stderr)
             for line in ctx.changed:
                 print(f"    {line}", file=sys.stderr)
-        elif not switched:
+        elif not switched and ctx.new is None:
             print("  nothing changed: the installed release is untouched", file=sys.stderr)
-        elif hint := rollback_hint(runtime, home, release.version):
-            print(f"  {hint}", file=sys.stderr)
+        if not switched and ctx.new is not None:
+            print("  nothing that runs changed; the prepared release stays for the next attempt", file=sys.stderr)
+        elif switched:
+            try:
+                hint = way_back()
+            except (Failure, OSError, subprocess.SubprocessError, KeyError, ValueError) as error:
+                print(f"  way back unavailable: {error}", file=sys.stderr)
+            else:
+                if hint:
+                    print(f"  {hint}", file=sys.stderr)
         return 1

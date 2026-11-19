@@ -31,7 +31,11 @@ class OutsideScope(ValueError):
 
 
 class NotAllowedFile(ValueError):
-    """The target is not a plain single regular file."""
+    """A refused file kind; callers carry kind unchanged in their own outcomes."""
+
+    def __init__(self, message: str, *, kind: str = "other") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class TooLarge(ValueError):
@@ -104,7 +108,7 @@ def parts(path: str, *, directory: bool = False, reserved: tuple[str, ...] = ())
         raise InvalidPath("path component is too long")
     hidden = RESERVED_PREFIXES + tuple(reserved)
     if any(p in ("", ".", "..", ".git") or p.startswith(hidden) or "\x00" in p for p in result):
-        raise OutsideScope("path outside editable scope")
+        raise OutsideScope("path outside the root")
     return result
 
 
@@ -121,8 +125,14 @@ def root_fd(root: Path) -> Iterator[int]:
 def directory_fd(root: int, components: tuple[str, ...]) -> Iterator[int]:
     fd = os.dup(root)
     try:
-        for component in components:
-            other = os.open(component, _directory_flags(), dir_fd=fd)
+        for index, component in enumerate(components):
+            try:
+                other = os.open(component, _directory_flags(), dir_fd=fd)
+            except FileNotFoundError as error:
+                # os.open knows only this basename. Preserve the missing folder
+                # relative to the caller's root, without exposing its host path.
+                raise FileNotFoundError(error.errno, "folder does not exist",
+                                        "/".join(components[:index + 1])) from None
             os.close(fd)
             fd = other
         yield fd
@@ -134,13 +144,19 @@ def read_regular(parent: int, name: str, maximum: int, *, single_link: bool = Fa
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise NotAllowedFile("path is a symbolic link; file tools do not follow links", kind="symlink") from None
         if error.errno == errno.ENXIO:  # a socket or a device without a reader
-            raise NotAllowedFile("file is not an allowed regular file") from None
+            raise NotAllowedFile("path is not a regular file; sockets, devices and FIFOs are not supported", kind="other") from None
         raise
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or (single_link and info.st_nlink != 1):
-            raise NotAllowedFile("file is not an allowed regular file")
+        if stat.S_ISDIR(info.st_mode):
+            raise NotAllowedFile("path is a directory; file tools read regular files (use file_list)", kind="directory")
+        if not stat.S_ISREG(info.st_mode):
+            raise NotAllowedFile("path is not a regular file; sockets, devices and FIFOs are not supported", kind="other")
+        if single_link and info.st_nlink != 1:
+            raise NotAllowedFile("file has multiple hard links; editing requires a single-link regular file", kind="other")
         if info.st_size > maximum:
             raise TooLarge("file exceeds read limit")
         chunks = bytearray()

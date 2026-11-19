@@ -17,31 +17,12 @@ class Caller:
     role: str
 
 
-class AccessPolicy:
-    """One trusted issuer, explicit subjects; a grant may name the author its data is stored under."""
-    def __init__(self, issuer: str, grants: list[dict[str, str]]) -> None:
-        if not issuer or not isinstance(grants, list):
-            raise ValueError("policy requires issuer and a list of grants")
-        # Author IDs name the issuer without a trailing slash, for every issuer. The OAuth
-        # metadata may show "https://host/" (pydantic adds "/" to a bare host); stored
-        # ownership (Canvas, Knowledge) uses this form, so it stays.
-        self.issuer = issuer.rstrip("/")
-        self.grants: dict[str, Caller] = {}
-        authors: set[str] = set()
-        for grant in grants:
-            if not isinstance(grant, dict) or set(grant) - {"subject", "role", "author"}:
-                raise ValueError("grant supports only subject, role and author")
-            subject, role = grant.get("subject"), grant.get("role")
-            if not isinstance(subject, str) or not subject or role not in {"reader", "writer"}:
-                raise ValueError("grant needs a subject and reader/writer role")
-            author = grant.get("author", json.dumps([self.issuer, subject], separators=(",", ":")))
-            if not isinstance(author, str) or not author or subject in self.grants or author in authors:
-                raise ValueError("subjects and author aliases must be nonempty and unique")
-            authors.add(author)
-            self.grants[subject] = Caller(self.issuer, subject, author, role)
-
-    def resolve(self, subject: str) -> Caller | None:
-        return self.grants.get(subject)
+def verified_caller(issuer: str, subject: str, role: Any) -> Caller:
+    """Canonical attribution; each authentication mode owns the supplied role."""
+    if (not isinstance(issuer, str) or not issuer or not isinstance(subject, str) or not subject
+            or not isinstance(role, str) or role not in {"reader", "writer"}):
+        raise ValueError("a verified caller needs issuer, subject and a reader/writer role")
+    return Caller(issuer, subject, json.dumps([issuer, subject], separators=(",", ":")), role)
 
 
 def calling_caller() -> Caller:

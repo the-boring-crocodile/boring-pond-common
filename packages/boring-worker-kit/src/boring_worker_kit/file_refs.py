@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from .deadlines import REPLY_MARGIN_SECONDS, left
 from .settlement import settled
 from .files import FileTools
-from .outcomes import Refusal
+from .outcomes import Failed, Refused
 from .services import CALL_TIMEOUT_SECONDS
 
 MARKER = "$file"
@@ -59,7 +59,7 @@ def _reference(value: object) -> dict[str, Any] | None:
     target = value[MARKER]
     if (not isinstance(target, dict) or not {"root", "path"} <= set(target) <= {"root", "path", "sha256"}
             or not all(isinstance(target[k], str) for k in target)):
-        raise Refusal("invalid_request", 'a file reference is {"$file": {"root": ..., "path": ..., "sha256": optional}}',
+        raise Refused("invalid_request", 'a file reference is {"$file": {"root": ..., "path": ..., "sha256": optional}}',
                       fields=["arguments.$file"])
     return target
 
@@ -82,7 +82,7 @@ def _targets(arguments: object) -> list[tuple[tuple[str | int, ...], dict[str, A
     targets = []
     for found in _references(arguments):
         if len(targets) >= MAX_REFERENCES:
-            raise Refusal("limit", f"at most {MAX_REFERENCES} file references in one call")
+            raise Refused("limit", f"at most {MAX_REFERENCES} file references in one call")
         targets.append(found)
     return targets
 
@@ -95,7 +95,7 @@ def prepare_call(files: FileTools, arguments: object, save_to: object = None) ->
     and current hashes are deliberately checked later by call_service/resolve.
     """
     if arguments is not None and (not isinstance(arguments, dict) or _reference(arguments) is not None):
-        raise Refusal("invalid_request", "arguments must be an object; put the file reference inside it",
+        raise Refused("invalid_request", "arguments must be an object; put the file reference inside it",
                       fields=["arguments"])
     for _, target in _targets(arguments):
         files.prepare("file_read_bytes", {"root": target["root"], "path": target["path"], "length": 1})
@@ -125,12 +125,12 @@ async def _read(files: FileTools, target: dict[str, Any], budget: int) -> tuple[
         if sha is None:
             sha = now
             if "sha256" in target and target["sha256"] != sha:
-                raise Refusal("stale", "file reference: the file's sha256 is not the expected one",
+                raise Refused("stale", "file reference: the file's sha256 is not the expected one",
                               current_sha256=sha)
             if size > budget:
-                raise Refusal("limit", f"file references exceed {MAX_REFERENCE_BYTES} bytes in one call")
+                raise Refused("limit", f"file references exceed {MAX_REFERENCE_BYTES} bytes in one call")
         elif now != sha:
-            raise Refusal("stale", "file reference: the file changed while it was read", current_sha256=now)
+            raise Refused("stale", "file reference: the file changed while it was read", current_sha256=now)
         piece = base64.b64decode(chunk)
         data += piece
         offset += len(piece)
@@ -139,7 +139,7 @@ async def _read(files: FileTools, target: dict[str, Any], budget: int) -> tuple[
     try:
         text = bytes(data).decode("utf-8")
     except UnicodeDecodeError:
-        raise Refusal("invalid_request", "file reference: the file is not UTF-8 text") from None
+        raise Refused("invalid_request", "file reference: the file is not UTF-8 text") from None
     return text.removeprefix("\ufeff"), len(data)
 
 
@@ -176,7 +176,7 @@ def check_save_to(save_to: object) -> dict[str, Any] | None:
     if (not isinstance(save_to, dict) or set(save_to) != {"root", "path", "expected_sha256"}
             or not isinstance(save_to["root"], str) or not isinstance(save_to["path"], str)
             or not (save_to["expected_sha256"] is None or isinstance(save_to["expected_sha256"], str))):
-        raise Refusal("invalid_request", "save_to takes root, path and expected_sha256 "
+        raise Refused("invalid_request", "save_to takes root, path and expected_sha256 "
                       "(null for a new file, or the sha256 of the file to replace)", fields=["save_to"])
     return save_to
 
@@ -190,25 +190,25 @@ async def check_target(files: FileTools, save_to: dict[str, Any]) -> None:
         current = await files.call("file_read", {"operation": "file_read", "request_id": "save-to",
                                                  "root": save_to["root"], "path": save_to["path"],
                                                  "start_line": 1, "line_count": 1})
-    except Refusal as refusal:
+    except Refused as refusal:
         if refusal.code != "not_found":
             raise
         if save_to["expected_sha256"] is not None:
-            raise Refusal("stale", "save_to: the file is absent; use expected_sha256 null to create it",
+            raise Refused("stale", "save_to: the file is absent; use expected_sha256 null to create it",
                           current_sha256=None) from None
         # Absent file, or absent directory: file_write creates no directories.
         parent = posixpath.dirname(save_to["path"].rstrip("/")) or "."
         try:
             await files.call("file_list", {"operation": "file_list", "request_id": "save-to",
                                            "root": save_to["root"], "path": parent, "limit": 1})
-        except Refusal as missing:
+        except Refused as missing:
             if missing.code != "not_found":
                 raise
-            raise Refusal("not_found", f"save_to: the directory {parent} does not exist (file_write creates "
+            raise Refused("not_found", f"save_to: the directory {parent} does not exist (file_write creates "
                           "no directories)") from None
         return
     if save_to["expected_sha256"] != current["sha256"]:
-        raise Refusal("stale", "save_to: the file exists with another sha256"
+        raise Refused("stale", "save_to: the file exists with another sha256"
                       + ("; read it, or choose a new path" if save_to["expected_sha256"] is None else ""),
                       current_sha256=current["sha256"])
 
@@ -245,7 +245,7 @@ async def save(files: FileTools, save_to: dict[str, Any], answer: dict[str, obje
     - the file tools refuse the write: the answer with `save_to_refused` (the
       refusal, with its code; nothing was written);
     - the write fails, or does not finish within `timeout`: the answer with
-      `save_to_failed` ({"message", "effects": "unknown"}: the file may or may not
+      `save_to_failed` (a failed as_data() with unknown effects: the file may or may not
       be written). A write still running then goes on (the file tools own it)
       and its record goes to `on_late_save` with "landed_after": "timeout";
     - the caller is cancelled: the local write is waited for up to
@@ -280,8 +280,8 @@ async def save(files: FileTools, save_to: dict[str, Any], answer: dict[str, obje
             written = await asyncio.wait_for(asyncio.shield(write), timeout)
     except asyncio.TimeoutError:
         write.add_done_callback(late("timeout"))
-        problem = {"save_to_failed": {"message": "the write did not finish within this request's time; "
-                                      "the file may still be written", "effects": "unknown"}}
+        problem = {"save_to_failed": Failed("timeout", "the write did not finish within this request's time; "
+                                            "the file may still be written", effects="unknown").as_data()}
     except asyncio.CancelledError:
         if not settle:
             # Bounded: a hung file system must not hold a cancelled caller forever.
@@ -291,10 +291,11 @@ async def save(files: FileTools, save_to: dict[str, Any], answer: dict[str, obje
             else:
                 write.add_done_callback(late("timeout"))
         raise
-    except Refusal as refusal:
+    except Refused as refusal:
         problem = {"save_to_refused": refusal.as_data()}
     except Exception as error:  # an OS error (disk full, permissions) or a bug: the service ran
-        problem = {"save_to_failed": {"message": f"{type(error).__name__}: {error}"[:512], "effects": "unknown"}}
+        problem = {"save_to_failed": Failed("write_failed", f"{type(error).__name__}: {error}"[:512],
+                                            effects="unknown").as_data()}
     if problem:
         size = len(json.dumps(answer, ensure_ascii=True).encode())
         if size > (MAX_INLINE_ANSWER if max_inline_answer is None else max_inline_answer):
@@ -316,7 +317,7 @@ async def call_service(files: FileTools, arguments: object, save_to: object,
 
     Refused before anything is sent: a malformed save_to, a stale, unwritable or
     directory-less target, a reference refusal (see resolve), `arguments` that is
-    itself a reference (it must be an object), or no time left (`limit`; the
+    itself a reference (it must be an object), or no time left (`not_admitted`; the
     checks and reads before the call count against the deadline). Whatever `call`
     raises once it has sent (a timeout, a broken connection, the service's own
     failure) passes through unchanged: the call may have run. Cancellation during
@@ -331,17 +332,17 @@ async def call_service(files: FileTools, arguments: object, save_to: object,
         return await resolve({} if arguments is None else arguments, files)
     before = left(deadline)
     if before is not None and before <= 0:
-        raise Refusal("limit", "no time left for the service call in this request; nothing was sent")
+        raise Refused("not_admitted", "no time left for the service call in this request; nothing was sent")
     try:
         resolved, references = await (prepare() if before is None else asyncio.wait_for(prepare(), before))
     except asyncio.TimeoutError:
-        raise Refusal("limit", "file references and the save_to check did not finish within this "
+        raise Refused("not_admitted", "file references and the save_to check did not finish within this "
                       "request's time; nothing was sent") from None
     remaining = left(deadline)
     timeout = CALL_TIMEOUT_SECONDS if remaining is None else min(
         CALL_TIMEOUT_SECONDS, remaining - (REPLY_MARGIN_SECONDS if target is not None else 0.0))
     if timeout <= 0:
-        raise Refusal("limit", "no time left for the service call in this request; nothing was sent")
+        raise Refused("not_admitted", "no time left for the service call in this request; nothing was sent")
     answer = await call(resolved, timeout)
     if target is None:
         return answer

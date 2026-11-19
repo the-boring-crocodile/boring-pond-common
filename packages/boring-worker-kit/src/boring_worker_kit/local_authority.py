@@ -5,9 +5,9 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, cast
+from typing import Any
 from contextlib import suppress
-from .outcomes import Refusal
+from .outcomes import Failed, Refused
 from .framing import peer_uid as peer_uid
 from .protocol_json import decode_object
 
@@ -33,7 +33,10 @@ class LocalAuthority:
             raise ValueError("authority UID must be positive")
         self.path, self.uid = path, uid
 
-    async def request(self, operation: str, service: str | None = None) -> dict[str, Any]:
+    async def request(self, operation: str, service: str | None = None, *,
+                      pond: str | None = None) -> dict[str, Any]:
+        if service is not None and pond is not None:
+            raise ValueError("select a service or a Pond, not both")
         protected_path(self.path, self.uid)
         info = self.path.lstat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != self.uid:
@@ -46,14 +49,26 @@ class LocalAuthority:
                 request = {"operation": operation}
                 if service is not None:
                     request["service"] = service
+                if pond is not None:
+                    request["pond"] = pond
                 writer.write(encode(request)); await writer.drain()
                 response = decode_object(await reader.readline())
-                if response.get("ok") is not True:
-                    error = response.get("error")
-                    if isinstance(error, dict):
-                        raise Refusal(error["code"], error["message"])
-                    raise RuntimeError("local authority failed")
-                return cast(dict[str, Any], response["result"])
+                if response.get("ok") is True and set(response) == {"ok", "result"}:
+                    if isinstance(response["result"], dict):
+                        return response["result"]
+                if response.get("ok") is False and set(response) == {"ok", "outcome"}:
+                    data = response["outcome"]
+                    if isinstance(data, dict) and data.get("status") in ("refused", "failed"):
+                        cls = Refused if data["status"] == "refused" else Failed
+                        try:
+                            outcome = cls(data.get("code"), data.get("message"), **{
+                                k: v for k, v in data.items() if k not in ("status", "code", "message")})
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            raise outcome
+                raise Failed("bad_reply", "invalid authority response envelope",
+                             component="authority", effects="unknown")
             finally:
                 writer.close()
                 with suppress(ConnectionError):

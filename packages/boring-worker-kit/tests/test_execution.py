@@ -8,7 +8,7 @@ from boring_worker_kit.execution import EnvironmentExecutor, ForegroundInterrupt
 from boring_worker_kit.host_limits import HostLimits
 from boring_worker_kit.process import ProcessOutput, run_process
 from boring_worker_kit.settings import EnvironmentSettings
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class ExecutionTest(unittest.TestCase):
@@ -28,13 +28,13 @@ class ExecutionTest(unittest.TestCase):
         uncapped = HostLimits(1, None)
         bounded = HostLimits(1, 10)
         for invalid in (False, True, "0", float("nan"), float("inf"), 0, 0.05, 86401):
-            with self.subTest(invalid=invalid), self.assertRaises(Refusal):
+            with self.subTest(invalid=invalid), self.assertRaises(Refused):
                 prepare_command(settings, "true", None, invalid, uncapped, is_job=True)
         self.assertEqual(prepare_command(settings, "true", None, None, uncapped, is_job=True)[1], 120)
         self.assertEqual(prepare_command(settings, "true", None, 86400, uncapped, is_job=True)[1], 86400)
         self.assertEqual(prepare_command(settings, "true", None, 20, bounded, is_job=True)[1], 10)
         for zero_cap in (bounded, uncapped):
-            with self.assertRaises(Refusal):
+            with self.assertRaises(Refused):
                 prepare_command(settings, "true", None, 0, zero_cap, is_job=False)
 
     def test_result_carries_no_echo_or_counters(self) -> None:
@@ -55,7 +55,7 @@ class ExecutionTest(unittest.TestCase):
     def test_rejects_cwd_outside_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            with self.assertRaises(Refusal):
+            with self.assertRaises(Refused):
                 asyncio.run(
                     EnvironmentExecutor(self.make_settings(root), HostLimits(1, None)).execute(
                         "true",
@@ -123,7 +123,7 @@ class ForegroundDeadlineTest(unittest.IsolatedAsyncioTestCase):
                 for n in range(8)]
         try:
             await asyncio.wait_for(full.wait(), 1)
-            with self.assertRaisesRegex(Refusal, "^not_admitted: foreground admission timeout; command not started$"):
+            with self.assertRaisesRegex(Refused, "^not_admitted: foreground admission timeout; command not started$"):
                 await executor.execute("must-not-run", None, 0.1)
             release.set()
             await asyncio.gather(*jobs)

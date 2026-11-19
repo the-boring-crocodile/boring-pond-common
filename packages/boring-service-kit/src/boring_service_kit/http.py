@@ -1,21 +1,24 @@
-"""Putting a server on the network: its own issuer, an external one, access keys; Pond registration optional."""
+"""Putting a service on the network with one Crocodile, keys or own-issuer mode."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import ipaddress
 import logging
-from dataclasses import asdict
+import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
 from urllib.parse import urlsplit
 from mcp.server.auth.provider import ProviderTokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from boring_registry import POND_CALL_MARGIN_SECONDS, POND_CALL_SECONDS, Watchdog
-from .access import AccessPolicy
+from .access import verified_caller
 from .issuer import DEFAULT_METADATA_HOSTS, ClientPolicy, SQLiteIssuer, Target
-from .issuer.web import UnderPath, auth_settings, configure_issuer_routes, install, issuer_paths
-from .keys import EitherVerifier, KeyVerifier
+from .issuer.provider import read_approval_secret
+from .issuer.web import UnderPath, issuer_auth_settings, configure_issuer_routes, install, issuer_paths
+from .keys import KeyVerifier
 from .pond import (ControlPlane, IntrospectionVerifier, Registration, read_secret, run, wrap_app)
 
 
@@ -31,23 +34,23 @@ def _url(value: Any, name: str) -> str:
     return value.rstrip("/")
 
 
-LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+def _loopback_bind(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class ServiceVerifier(IntrospectionVerifier):
-    def __init__(self, authority: ControlPlane, own_url: str, endpoint: str,
-                 policy: AccessPolicy, scopes: list[str]) -> None:
-        super().__init__(authority, own_url)
-        self.endpoint = endpoint
-        self.policy = policy
-        self.scopes = scopes
-
+    """Crocodile owns the role; only its authenticated introspection can supply it."""
     def accept(self, token: str, answer: Any, now: float) -> Any:
         if not isinstance(answer, dict):
             return None
-        # Introspection is an authenticated answer from the configured issuer.
-        issuer = answer.get("iss", self.policy.issuer)
-        if not isinstance(issuer, str) or issuer.rstrip("/") != self.policy.issuer:
+        issuer = self.control_plane.url
+        received = answer.get("iss", issuer)
+        if not isinstance(received, str) or received.rstrip("/") != issuer:
             return None
         audience = answer.get("aud")
         if isinstance(audience, list) and self.own_url in audience:
@@ -55,113 +58,176 @@ class ServiceVerifier(IntrospectionVerifier):
         access = super().accept(token, answer, now)
         if access is None:
             return None
-        caller = self.policy.resolve(access.subject or "")
-        scope = answer.get("scope", "")
-        if not isinstance(scope, str) or not set(self.scopes) <= set(scope.split()):
+        try:
+            caller = verified_caller(issuer, access.subject or "", answer.get("role"))
+        except ValueError:
             return None
-        if caller is None:
-            return None
-        access.scopes = scope.split()
         access.claims = {"boring_caller": asdict(caller)}
         return access
 
 
+@dataclass(frozen=True)
+class ServiceInfo:
+    """Validated frontend metadata, without credentials or runtime behavior."""
+    url: str
+    bind: str
+    port: int
+    client_id: str | None
+    authority_url: str | None
+
+
 class ServiceConfig:
-    """Strict JSON config: how a server is put on the network. Relative files resolve next to the config.
+    """One explicit auth mode: Crocodile grants, access keys or an own issuer.
 
-    | key | tokens come from |
-    |---|---|
-    | `issuer` | this server: approval secret, pre-registered and metadata-document clients |
-    | `oauth` | an external issuer, checked by introspection (a Crocodile, Keycloak, Entra) |
-    | `keys` | nobody: static access keys (combines with either of the above) |
-    | `pond` | (heartbeat registration with a Crocodile, beside `oauth`; never with `issuer`) |
-
-    `access` lists the subjects an issuer may vouch for, each a reader or writer.
+    Crocodile uses one authority for introspection and heartbeat registration.
+    Keys carry their role; an own issuer declares one role for approved clients.
     """
-    KEYS = {"url", "bind", "port", "oauth", "issuer", "access", "keys", "pond"}
+    KEYS = {"url", "mode", "crocodile", "issuer", "keys", "bind", "port", "behind_proxy"}
     auth: dict[str, Any]
     token_verifier: Any  # the bearer check, also for a server's own non-MCP routes
     ISSUER_KEYS = {"url", "database", "approval_secret_file", "subject", "name", "dynamic_registration",
-                   "metadata_document_hosts"}
+                   "metadata_document_hosts", "role"}
 
     def __init__(self, path: Path) -> None:
+        self._configure(path, initialize=True)
+
+    @classmethod
+    def validate(cls, path: Path) -> None:
+        """Use startup's parser without opening issuer state or starting a server.
+
+        Configuration and referenced client secrets are read. Database contents,
+        filesystem write permissions and network reachability are not tested.
+        The private validation instance never becomes a runnable service.
+        """
+        cls.inspect(path)
+
+    @classmethod
+    def inspect(cls, path: Path) -> ServiceInfo:
+        """Validate read-only and return the same safe metadata runtime uses."""
+        config = cls.__new__(cls)
+        config._configure(path, initialize=False)
+        return config.info()
+
+    @classmethod
+    def inspect_value(cls, data: dict[str, Any], path: Path) -> ServiceInfo:
+        """Validate a planned config with startup's parser, without writing it.
+
+        Relative credentials resolve against the eventual config path.
+        No database is opened and no runtime state is created.
+        """
+        config = cls.__new__(cls)
+        config._configure_value(data, path, initialize=False)
+        return config.info()
+
+    def info(self) -> ServiceInfo:
+        authority = getattr(self, "authority", None)
+        return ServiceInfo(self.url, self.bind, self.port,
+                           authority.client_id if authority is not None else None,
+                           authority.url if authority is not None else None)
+
+    def _configure(self, path: Path, *, initialize: bool) -> None:
         data = json.loads(path.read_text(encoding="utf-8"))
+        self._configure_value(data, path, initialize=initialize)
+
+    def _configure_value(self, data: Any, path: Path, *, initialize: bool) -> None:
+        if isinstance(data, dict):
+            replacements = {"access": "role on the Crocodile grant, key or own issuer",
+                            "oauth": "mode=crocodile with one crocodile authority block",
+                            "pond": "mode=crocodile; registration reuses its authority"}
+            old = sorted(set(data) & set(replacements))
+            if old:
+                raise ValueError("; ".join(key + " is replaced by " + replacements[key] for key in old))
         if not isinstance(data, dict) or set(data) - self.KEYS:
             raise ValueError(f"config supports {', '.join(sorted(self.KEYS))}")
-        if not {"oauth", "issuer", "keys"} & set(data):
-            raise ValueError("config needs issuer, oauth or keys")
-        if "oauth" in data and "issuer" in data:
-            raise ValueError("oauth and issuer exclude each other: tokens come from one issuer")
-        if "issuer" in data and data.get("pond") is not None:
-            raise ValueError("issuer and pond exclude each other: a Pond calls only with the Crocodile's tokens "
-                             "(oauth); a server with its own sign-in serves a person's client directly")
-        if "access" in data and not {"oauth", "issuer"} & set(data):
-            raise ValueError("access lists OAuth subjects; with keys only, each key names its person and role")
-        self._listen(data)
-        scopes = self._oauth_scopes(data["oauth"]) if "oauth" in data else ["mcp"] if "issuer" in data else []
+        modes = {"crocodile", "keys", "issuer"}
+        self.mode = data.get("mode")
+        if not isinstance(self.mode, str) or self.mode not in modes:
+            raise ValueError("mode must select exactly one of crocodile, keys or issuer")
+        if set(data) & modes != {self.mode}:
+            raise ValueError("configure exactly one authentication mode and its matching block")
+        self._listen(data, path)
         self.keys: KeyVerifier | None = None
-        if "keys" in data:
+        self.verifier: ServiceVerifier | None = None
+        self.issuer: SQLiteIssuer | None = None
+        self.watchdog: Watchdog | None = None
+        if self.mode == "crocodile":
+            self._crocodile(path, data["crocodile"])
+        elif self.mode == "issuer":
+            self.issuer = self._issuer(path, data["issuer"], initialize=initialize)
+            if self.issuer is not None:
+                self.auth["auth_server_provider"] = self.issuer
+                self.token_verifier = ProviderTokenVerifier(self.issuer)
+        else:
             keys = data["keys"]
             if not isinstance(keys, dict) or set(keys) != {"file"}:
                 raise ValueError("keys needs exactly file (the key file, see boring-service-keys)")
-            self.keys = KeyVerifier(self.file(path, keys["file"], "keys file"), self.url, scopes)
-        self.verifier: ServiceVerifier | None = None
-        self.issuer: SQLiteIssuer | None = None
-        if "oauth" in data:
-            self._external(path, data["oauth"], data.get("access", []), scopes)
-        elif "issuer" in data:
-            self.issuer = self._issuer(path, data["issuer"], data.get("access", []))
-            self.auth = {"auth_server_provider": self.issuer, "auth": auth_settings(self.issuer, self.url)}
-            # For a server's own non-MCP routes that take the same bearer (fishmarket's transfers).
-            self.token_verifier = ProviderTokenVerifier(self.issuer)
-        else:  # keys only: no authority to name; resource metadata points at the service itself
-            self.token_verifier = EitherVerifier(self.keys, None)
+            self.keys = KeyVerifier(self.file(path, keys["file"], "keys file"), self.url)
+            self.token_verifier = self.keys
             self.auth = {"token_verifier": self.token_verifier,
                          "auth": AuthSettings(issuer_url=cast(Any, self.url), resource_server_url=cast(Any, self.url),
                                               validate_token_resource=True)}
-        self.watchdog = self._pond(path, data["pond"]) if data.get("pond") is not None else None
 
-    def _listen(self, data: dict[str, Any]) -> None:
+    def _listen(self, data: dict[str, Any], path: Path) -> None:
         self.url = _url(data["url"], "url")
+        container = os.environ.get("BORING_SERVICE_CONTAINER")
+        if container not in {None, "1"}:
+            raise ValueError("BORING_SERVICE_CONTAINER must be 1 in service images, or absent for native runs")
+        raw = os.environ.get("BORING_SERVICE_LISTENERS")
+        if container == "1":
+            old = sorted(set(data) & {"bind", "port", "behind_proxy"})
+            if old:
+                raise ValueError("; ".join(key + " is replaced by Compose environment BORING_SERVICE_LISTENERS"
+                                           for key in old))
+            source = str(path.resolve())
+            try:
+                listeners = json.loads(raw or "{}")
+            except ValueError:
+                raise ValueError("BORING_SERVICE_LISTENERS must be a JSON object keyed by absolute config path") from None
+            if not isinstance(listeners, dict):
+                raise ValueError("BORING_SERVICE_LISTENERS must be a JSON object keyed by absolute config path")
+            for name, listener in listeners.items():
+                if (not Path(name).is_absolute() or not isinstance(listener, dict)
+                        or set(listener) != {"bind", "port"}
+                        or not isinstance(listener["bind"], str) or not listener["bind"]
+                        or type(listener["port"]) is not int or not 1 <= listener["port"] <= 65535):
+                    raise ValueError("BORING_SERVICE_LISTENERS entries need an absolute config path and exactly bind (host), port (1..65535)")
+            if source not in listeners:
+                raise ValueError("BORING_SERVICE_LISTENERS needs an address for " + source)
+            self.bind, self.port = listeners[source]["bind"], listeners[source]["port"]
+            return
+        if raw is not None:
+            raise ValueError("BORING_SERVICE_LISTENERS requires BORING_SERVICE_CONTAINER=1")
         self.bind = data.get("bind", "127.0.0.1")
         self.port = data.get("port", urlsplit(self.url).port or 8000)
         if not isinstance(self.bind, str) or not self.bind:
             raise ValueError("bind must be a host")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ValueError("port must be 1..65535")
-        if urlsplit(self.url).scheme != "https" and self.bind not in LOOPBACK:
-            raise ValueError("bearer authentication over plain HTTP needs a loopback bind; use HTTPS otherwise")
+        self.behind_proxy = data.get("behind_proxy", False)
+        if type(self.behind_proxy) is not bool:
+            raise ValueError("behind_proxy must be boolean")
+        # The public URL describes the proxy, not this plaintext listener.
+        if not _loopback_bind(self.bind) and not self.behind_proxy:
+            raise ValueError("plain HTTP bearer authentication needs a loopback bind; "
+                             "a trusted proxy on another host or container network requires "
+                             "explicit behind_proxy=true and restricted network access")
 
-    @staticmethod
-    def _oauth_scopes(oauth: Any) -> list[str]:
-        if not isinstance(oauth, dict) or set(oauth) - {"issuer", "introspection_url", "client_id", "secret_file", "scopes"}:
-            raise ValueError("invalid oauth configuration")
-        scopes = oauth.get("scopes", [])
-        if not isinstance(scopes, list) or any(not isinstance(s, str) or not s for s in scopes):
-            raise ValueError("scopes must be a list of nonempty strings")
-        return scopes
-
-    def _external(self, path: Path, oauth: dict[str, Any], access: Any, scopes: list[str]) -> None:
-        """Tokens from another issuer, checked by introspection (a Crocodile, Keycloak, Entra)."""
-        issuer = _url(oauth["issuer"], "issuer")
-        endpoint = _url(oauth["introspection_url"], "introspection_url")
-        if not isinstance(oauth["client_id"], str) or not oauth["client_id"]:
-            raise ValueError("OAuth client_id must be nonempty")
-        self.policy = AccessPolicy(issuer, access)
-        self.authority = ControlPlane(issuer, oauth["client_id"], read_secret(self.file(path, oauth["secret_file"])))
-        self.verifier = ServiceVerifier(self.authority, self.url, endpoint, self.policy, scopes)
-        self.token_verifier = EitherVerifier(self.keys, self.verifier)
+    def _crocodile(self, path: Path, authority: Any) -> None:
+        if not isinstance(authority, dict) or set(authority) != {"url", "client_id", "secret_file"}:
+            raise ValueError("crocodile needs exactly url, client_id and secret_file")
+        issuer = _url(authority["url"], "Crocodile url")
+        if not isinstance(authority["client_id"], str) or not authority["client_id"]:
+            raise ValueError("Crocodile client_id must be nonempty")
+        self.authority = ControlPlane(issuer, authority["client_id"],
+                                      read_secret(self.file(path, authority["secret_file"])))
+        self.verifier = ServiceVerifier(self.authority, self.url)
+        self.token_verifier = self.verifier
         self.auth = {"token_verifier": self.token_verifier,
                      "auth": AuthSettings(issuer_url=cast(Any, issuer), resource_server_url=cast(Any, self.url),
-                                          validate_token_resource=True, required_scopes=scopes or None)}
+                                          validate_token_resource=True)}
+        self.watchdog = Watchdog(Registration(self.authority))
 
-    def _pond(self, path: Path, pond: Any) -> Watchdog:
-        if not isinstance(pond, dict) or set(pond) != {"url", "client_id", "secret_file"}:
-            raise ValueError("pond requires url, client_id and secret_file")
-        return Watchdog(Registration(ControlPlane(_url(pond["url"], "pond url"), pond["client_id"],
-                                                  read_secret(self.file(path, pond["secret_file"])))))
-
-    def _issuer(self, path: Path, spec: Any, access: Any) -> SQLiteIssuer:
+    def _issuer(self, path: Path, spec: Any, *, initialize: bool) -> SQLiteIssuer | None:
         if not isinstance(spec, dict) or set(spec) - self.ISSUER_KEYS:
             raise ValueError(f"issuer supports {', '.join(sorted(self.ISSUER_KEYS))}")
         own = urlsplit(self.url)
@@ -175,19 +241,21 @@ class ServiceConfig:
             raise ValueError("dynamic_registration must be true or false")
         if not isinstance(hosts, list) or any(not isinstance(h, str) for h in hosts):
             raise ValueError("metadata_document_hosts must be a list of host names")
-        self.policy = AccessPolicy(issuer_url, access)
-        if self.policy.resolve(subject) is None:
-            raise ValueError("issuer.subject must be listed in access, with its role")
+        caller = verified_caller(issuer_url, subject, spec.get("role"))
 
         def claims(token_subject: str) -> dict[str, Any] | None:
-            caller = self.policy.resolve(token_subject)
-            return None if caller is None else {"boring_caller": asdict(caller)}
+            return {"boring_caller": asdict(caller)} if token_subject == subject else None
 
         target = Target(subject, name, self.file(path, spec.get("approval_secret_file"), "approval_secret_file"))
-        return SQLiteIssuer(issuer_url, self.file(path, spec.get("database"), "issuer database").resolve(),
-                            {self.url: "owner"}, {"owner": target},
-                            ClientPolicy(dynamic_registration=dynamic, metadata_hosts=tuple(hosts)),
-                            claims=claims, also=self.keys)
+        database = self.file(path, spec.get("database"), "issuer database").resolve()
+        policy = ClientPolicy(dynamic_registration=dynamic, metadata_hosts=tuple(hosts))
+        # SDK settings are part of validation too, before any issuer-store effect.
+        self.auth = {"auth": issuer_auth_settings(issuer_url, self.url, policy)}
+        if not initialize:
+            return None
+        read_approval_secret(target.secret_file)
+        return SQLiteIssuer(issuer_url, database, {self.url: "owner"}, {"owner": target},
+                            policy, claims=claims)
 
     @staticmethod
     def file(config: Path, value: Any, what: str = "secret_file") -> Path:
@@ -234,4 +302,4 @@ class ServiceConfig:
 
 
 def add_config_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, help="HTTP service configuration JSON (OAuth and/or access keys)")
+    parser.add_argument("--config", type=Path, help="HTTP service configuration JSON (one Crocodile, keys or own-issuer mode)")

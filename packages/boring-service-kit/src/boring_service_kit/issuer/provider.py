@@ -35,7 +35,7 @@ from typing import Any, Callable, NamedTuple
 import httpx2
 from mcp.server.auth.provider import (
     AccessToken, AuthorizationCode, AuthorizationParams, AuthorizeError, OAuthAuthorizationServerProvider,
-    RefreshToken, RegistrationError, TokenError, TokenVerifier, construct_redirect_uri,
+    RefreshToken, RegistrationError, TokenError, construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, BaseModel, ValidationError
@@ -54,6 +54,7 @@ REFRESH_SECONDS = 14 * 86400  # 14 days unused before the approval secret is ask
 # There is no global pause: the approval secret is long and random, so guessing
 # is not the threat, and a pause anyone can trigger would lock out the owner.
 MAX_APPROVAL_ATTEMPTS = 5
+APPROVAL_SECRET_MIN = 24
 # Clients nobody approved yet (dynamic registrations, cached metadata
 # documents) expire after a day, and only those count against a cap per
 # origin. An active client exists only after an approval with the secret.
@@ -79,6 +80,16 @@ class Target:
     subject: str
     display_name: str
     secret_file: Path
+
+
+def read_approval_secret(path: Path) -> str:
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ValueError(f"{path}: cannot read approval secret as UTF-8") from None
+    if len(secret) < APPROVAL_SECRET_MIN:
+        raise ValueError(f"{path}: approval secret must have at least {APPROVAL_SECRET_MIN} characters")
+    return secret
 
 
 class ConsentDetails(NamedTuple):
@@ -143,11 +154,9 @@ class SQLiteIssuer(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshTo
     def __init__(self, issuer_url: str, database_file: Path, resources: dict[str, str | None],
                  targets: dict[str, Target], policy: ClientPolicy = ClientPolicy(), *,
                  initialize: Initializer = initialize_issuer_store, fetch: Fetch = fetch_document,
-                 claims: Callable[[str], dict[str, Any] | None] | None = None,
-                 also: TokenVerifier | None = None) -> None:
+                 claims: Callable[[str], dict[str, Any] | None] | None = None) -> None:
         """`resources`: canonical resource URL -> target name, or None (the page asks).
-        `claims(subject)`: extra claims for an access token, or None to refuse it.
-        `also`: another verifier for tokens this issuer did not mint (access keys)."""
+        `claims(subject)`: extra claims for an access token, or None to refuse it."""
         self.issuer_url = issuer_url.rstrip("/")
         self.database_file = database_file
         self.resources = {str(canonical_resource(url)): name for url, name in resources.items()}
@@ -157,7 +166,6 @@ class SQLiteIssuer(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshTo
         self.policy = policy
         self.fetch = fetch
         self.claims = claims
-        self.also = also
         # request_id -> (wrong secrets so far, when the pending request expires).
         # In memory: one process; a restart resets the counts.
         self.wrong_secrets: dict[str, tuple[int, float]] = {}
@@ -362,8 +370,12 @@ class SQLiteIssuer(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshTo
         target = self.targets.get(self.pending_target(request_id) or target_name or "")
         if target is None:
             return Denied(400, f"Choose {self.target_noun()}.")
-        expected = target.secret_file.read_text().strip()
-        if not expected or not hmac.compare_digest(supplied_secret.encode(), expected.encode()):
+        try:
+            expected = read_approval_secret(target.secret_file)
+        except ValueError as error:
+            log.error("%s", error)
+            return Denied(503, "Approval is unavailable. Ask the operator to check the approval secret.")
+        if not hmac.compare_digest(supplied_secret.encode(), expected.encode()):
             return self._wrong_secret(request_id)
         self.wrong_secrets.pop(request_id, None)
         with self._transaction() as db:
@@ -416,9 +428,6 @@ class SQLiteIssuer(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshTo
         return token if self._subject_allowed(token) and token.client_id == client.client_id else None
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        if self.also is not None and not token.startswith("access_"):
-            found: AccessToken | None = await self.also.verify_token(token)
-            return found
         grant: AccessToken | None = await asyncio.to_thread(self._load, "access", token, AccessToken)
         if grant is None or not self._subject_allowed(grant):
             return None

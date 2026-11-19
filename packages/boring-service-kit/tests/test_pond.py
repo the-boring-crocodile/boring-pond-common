@@ -1,5 +1,5 @@
 """The service side of SERVICES_AND_PIRATES.md, on the one path services use: a server
-put on the network by ServiceConfig with an `oauth`, an `access` and a `pond` section.
+put on the network by ServiceConfig with one Crocodile authority block.
 
 Real SDK app over httpx2's ASGI transport; a fake control plane (a stdlib HTTP
 server in a thread) answers /introspect and /services/register.
@@ -23,11 +23,6 @@ from boring_service_kit.pond import ControlPlane, Registration, attach_heartbeat
 from boring_service_kit.testing import CLIENT_ID, OWN_URL, SECRET, FakeControlPlane, mcp_headers, mcp_meta
 from boring_service_kit.testing import Service as HarnessService
 from boring_service_kit.tools import READ_ONLY, as_mcp_tool, refuse_unknown_arguments
-
-# The Ponds this service serves; the harness's control plane also knows tokens for others.
-ACCESS = [{"subject": "pond", "role": "writer", "author": "pond"},
-          {"subject": "meadow", "role": "reader", "author": "meadow"}]
-
 
 def make_server(auth: dict[str, Any], on_discover: Any) -> MCPServer:
     """What a service does with the kit: its own server, the config's auth, heartbeat and conventions."""
@@ -54,11 +49,8 @@ def service_config(directory: Path, control_plane: str) -> ServiceConfig:
     (directory / "secret").write_text(SECRET)
     path = directory / "config.json"
     path.write_text(json.dumps({
-        "url": OWN_URL,
-        "oauth": {"issuer": control_plane, "introspection_url": control_plane + "/introspect",
-                  "client_id": CLIENT_ID, "secret_file": "secret"},
-        "access": ACCESS,
-        "pond": {"url": control_plane, "client_id": CLIENT_ID, "secret_file": "secret"}}))
+        "url": OWN_URL, "mode": "crocodile",
+        "crocodile": {"url": control_plane, "client_id": CLIENT_ID, "secret_file": "secret"}}))
     return ServiceConfig(path)
 
 
@@ -82,17 +74,17 @@ def run(coro: Any) -> Any:
 def test_the_caller_is_the_pond_named_in_its_token(tmp_path):
     async def scenario() -> None:
         async with Service(tmp_path) as service:
-            assert await service.result("whoami", {}, token="pond") == (False, {"pond": "pond"})
-            assert await service.result("whoami", {}, token="meadow") == (False, {"pond": "meadow"})
+            assert await service.result("whoami", {}, token="pond") == (False, {"pond": json.dumps([service.cp.url, "pond"], separators=(",", ":"))})
+            assert await service.result("whoami", {}, token="meadow") == (False, {"pond": json.dumps([service.cp.url, "meadow"], separators=(",", ":"))})
     run(scenario())
 
 
-def test_a_valid_token_for_a_pond_not_in_access_is_refused(tmp_path):
+def test_a_new_granted_subject_needs_no_service_list_edit(tmp_path):
     async def scenario() -> None:
         async with Service(tmp_path) as service:
             service.cp.tokens["garden"] = dict(service.cp.tokens["pond"], sub="garden")
-            assert (await service.call("whoami", {}, token="garden")).status_code == 401
-            assert await service.result("whoami", {}, token="pond") == (False, {"pond": "pond"})
+            assert await service.result("whoami", {}, token="garden") == (False, {"pond": json.dumps([service.cp.url, "garden"], separators=(",", ":"))})
+            assert await service.result("whoami", {}, token="pond") == (False, {"pond": json.dumps([service.cp.url, "pond"], separators=(",", ":"))})
     run(scenario())
 
 
@@ -108,7 +100,7 @@ def test_a_good_token_is_introspected_once_then_cached(tmp_path):
     async def scenario() -> None:
         async with Service(tmp_path) as service:
             for _ in range(3):
-                assert await service.result("whoami", {}) == (False, {"pond": "pond"})
+                assert await service.result("whoami", {}) == (False, {"pond": json.dumps([service.cp.url, "pond"], separators=(",", ":"))})
             assert service.cp.introspections() == 1
             for _ in range(2):  # refusals are never cached
                 assert (await service.call("whoami", {}, token="unknown")).status_code == 401
@@ -155,7 +147,7 @@ def test_refusals_read_as_the_worker_reads_them(tmp_path):
     async def scenario() -> None:
         async with Service(tmp_path) as service:
             is_error, refusal = await service.result("refuse", {"reason": "no"})
-            # The worker's rule (services.py, _tool_refusal): JSON with a code and a message.
+            # The worker preserves a valid status, code, message and any extra fields.
             assert is_error and refusal == {"status": "refused", "code": "invalid_request", "message": "no"}
     run(scenario())
 
@@ -246,4 +238,40 @@ def test_heartbeat_is_answered_while_a_tool_works(tmp_path):
             assert response.status_code == 200, response.text
             assert (await call).status_code == 200
             assert answered < 0.5, f"heartbeat waited {answered:.2f} s for the busy tool"
+    run(scenario())
+
+
+def test_published_outcome_tools_are_text_only_with_flat_details(tmp_path):
+    from boring_service_kit.outcomes import Failed
+
+    def make(auth, on_discover):
+        server = make_server(auth, on_discover)
+
+        def outcome(failed: bool) -> dict:
+            """Return a normal outcome for the fixture."""
+            cls = Failed if failed else Refused
+            raise cls("timeout", "fixture deadline", retry_after_seconds=3)
+
+        server.tool(annotations=READ_ONLY)(as_mcp_tool(permitted(outcome, "reader"), CallLog(None)))
+        return server
+
+    async def scenario():
+        async with Service(tmp_path, make) as service:
+            response = await service.client.post("/mcp", headers=mcp_headers("tools/list", token="pond"),
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": mcp_meta()}})
+            assert response.status_code == 200, response.text
+            tools = response.json()["result"]["tools"]
+            tool = next(tool for tool in tools if tool["name"] == "outcome")
+            assert tool.get("outputSchema") is None
+            for failed, status in ((False, "refused"), (True, "failed")):
+                response = await service.call("outcome", {"failed": failed})
+                assert response.status_code == 200, response.text
+                result = response.json()["result"]
+                assert result["isError"] is True
+                assert result.get("structuredContent") is None
+                assert len(result["content"]) == 1
+                assert result["content"][0]["type"] == "text"
+                assert json.loads(result["content"][0]["text"]) == {
+                    "status": status, "code": "timeout", "message": "fixture deadline",
+                    "retry_after_seconds": 3}
     run(scenario())

@@ -128,19 +128,19 @@ def test_cli_remove_and_renew_change_the_file(tmp_path, capsys):
 
 def config(tmp_path, data):
     path = tmp_path / "config.json"
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps({"mode": "keys", **data}))
     return ServiceConfig(path)
 
 
 def test_config_rules(tmp_path):
-    with pytest.raises(ValueError, match="issuer, oauth or keys"):
+    with pytest.raises(ValueError, match="exactly one"):
         config(tmp_path, {"url": URL})
     with pytest.raises(ValueError, match="loopback bind"):
         config(tmp_path, {"url": URL, "bind": "0.0.0.0", "keys": {"file": "keys.json"}})
-    with pytest.raises(ValueError, match="with keys only"):
+    with pytest.raises(ValueError, match="role"):
         config(tmp_path, {"url": URL, "keys": {"file": "keys.json"}, "access": []})
     https = config(tmp_path, {"url": "https://knowledge.example/mcp", "bind": "0.0.0.0", "port": 18512,
-                              "keys": {"file": "keys.json"}})
+                              "behind_proxy": True, "keys": {"file": "keys.json"}})
     assert https.keys is not None and https.verifier is None
     assert https.keys.path == (tmp_path / "keys.json").resolve()
 
@@ -181,27 +181,7 @@ def test_http_keys_only_reader_writer_and_attribution(tmp_path):
     asyncio.run(scenario())
 
 
-def test_http_keys_beside_oauth(tmp_path):
-    keyfile = tmp_path / "keys.json"
-    _, secret = keys.add(keyfile, "robin@vm", "reader", 1, issuer=ISSUER)
-
-    async def scenario():
-        service = Service()
-        (tmp_path / "secret").write_text("test-only")
-        cfg = config(tmp_path, {
-            "url": URL, "keys": {"file": "keys.json"},
-            "oauth": {"issuer": service.cp.url, "introspection_url": service.cp.url + "/introspect",
-                      "client_id": "test-client", "secret_file": "secret"},
-            "access": [{"subject": "pond", "role": "writer", "author": "pond"}]})
-        service.cp.tokens["pond"] = {"active": True, "aud": cfg.url, "exp": int(time.time()) + 60, "sub": "pond"}
-        server = MCPServer("both-test", **cfg.auth)
-
-        def read():
-            return {"author": calling_author()}
-        server.tool(annotations=READ_ONLY)(as_mcp_tool(permitted(read, "reader"), CallLog(None)))
-        service.app = wrap_app(server, cfg.url, discover_bypass=False)
-        async with service:
-            assert (await service.result("read", {}, "pond")) == (False, {"author": "pond"})
-            refused, data = await service.result("read", {}, secret)
-            assert not refused and json.loads(data["author"]) == [ISSUER, "robin@vm"]
-    asyncio.run(scenario())
+def test_keys_and_crocodile_cannot_share_one_service(tmp_path):
+    with pytest.raises(ValueError, match="exactly one"):
+        config(tmp_path, {"url": URL, "keys": {"file": "keys.json"},
+                          "crocodile": {"url": "https://issuer.test", "client_id": "x", "secret_file": "missing"}})

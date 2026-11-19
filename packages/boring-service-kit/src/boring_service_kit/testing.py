@@ -104,9 +104,10 @@ class Service:
     def __init__(self, app: Any = None, own_url: str = OWN_URL) -> None:
         self.cp = FakeControlPlane()
         now = int(time.time())
-        good = {"active": True, "aud": OWN_URL, "exp": now + 300, "sub": "pond", "client_id": "control-plane"}
+        good = {"active": True, "aud": OWN_URL, "exp": now + 300, "sub": "pond",
+                "role": "writer", "client_id": "control-plane"}
         self.cp.tokens.update({
-            "pond": good, "meadow": dict(good, sub="meadow"),
+            "pond": good, "meadow": dict(good, sub="meadow", role="reader"),
             "other-service": dict(good, aud="http://127.0.0.1:18512/mcp"),
             "expired": dict(good, exp=now - 1), "no-sub": {k: v for k, v in good.items() if k != "sub"}})
         self.watchdog = RecordingWatchdog()

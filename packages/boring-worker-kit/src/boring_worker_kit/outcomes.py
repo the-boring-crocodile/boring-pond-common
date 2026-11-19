@@ -1,50 +1,38 @@
-"""Typed normal outcomes shared by local tool callers."""
+"""Worker outcomes and their failure presentation; boring-outcomes owns the types."""
 from __future__ import annotations
-import re
 
-CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+from logging import Logger
+from typing import cast
+from boring_outcomes import CODE, OUR_CODES, Failed, Outcome, Refused, is_code
 
-# Our own vocabulary. Codes from a downstream component (a Pirate, a service)
-# are passed through unchanged and need not appear here.
-OUR_CODES: dict[str, str] = {
-    "invalid_request": "the request itself is malformed or not acceptable; change it",
-    "not_found": "the named thing (file, job, Pirate, service) does not exist here",
-    "forbidden": "this Pond's policy does not allow it",
-    "stale": "the file changed since it was read; re-read (see current_sha256) and retry",
-    "busy": "a shared resource is held right now; retry later",
-    "limit": "a size, count or capacity limit was reached",
-    "not_admitted": "the work was not started (no capacity before the deadline); safe to retry",
-    "unavailable": "the component that would answer is not running or not listening",
-}
+__all__ = ["CODE", "OUR_CODES", "Failed", "Outcome", "Refused", "is_code", "failure_data"]
 
 
-def is_code(value: object) -> bool:
-    return isinstance(value, str) and CODE.fullmatch(value) is not None
+def failure_data(error: Exception, *, component: str, fallback_code: str,
+                 logger: Logger | None) -> dict[str, object]:
+    """Preserve typed outcomes; classify exceptions and keep their text in logs.
 
-
-class Refusal(Exception):
-    """A normal outcome the caller can act on -- not a failure.
-
-    Raised where the outcome is decided, caught once at the worker's request
-    boundary and turned into data there. Nothing else becomes a refusal: any
-    other exception is reported as a failure. (Phase 1 keeps this one typed
-    exception as the carrier out of deep call chains; later phases return
-    outcomes directly as they rewrite those chains.)
+    Pass no logger only when the caller has already logged the exception.
+    Imports stay here: execution and services use the outcome types themselves.
     """
+    if isinstance(error, Outcome):
+        return error.as_data()
+    from .execution import ForegroundInterrupted
+    from .process import ProcessCleanupError
+    from .services import ServiceFailure
+    from .task_client import ContainmentError
 
-    def __init__(self, code: str, message: str, **details: object) -> None:
-        if not is_code(code):
-            raise ValueError(f"invalid refusal code {code!r}")
-        if not isinstance(message, str):
-            raise TypeError("refusal message must be a string")
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.details = details
-
-    def __str__(self) -> str:
-        return f"{self.code}: {self.message}"
-
-    def as_data(self) -> dict[str, object]:
-        return {"code": self.code, "message": self.message, **self.details}
-
+    if isinstance(error, ServiceFailure):
+        data = error.data
+        extra = {key: value for key, value in data.items() if key not in ("status", "code", "message")}
+        if data.get("status") != "failed":
+            raise ValueError("service failure must have failed status")
+        return Failed(cast(str, data.get("code")), cast(str, data.get("message")), **extra).as_data()
+    code = ("cleanup_unconfirmed" if isinstance(error, (ContainmentError, ProcessCleanupError))
+            else "foreground_interrupted" if isinstance(error, ForegroundInterrupted)
+            else "timeout" if isinstance(error, TimeoutError)
+            else fallback_code)
+    if logger is not None:
+        logger.error("%s failure", component, exc_info=(type(error), error, error.__traceback__))
+    return Failed(code, f"{type(error).__name__}: The {component.capitalize()} failed; see its log for details.",
+                  component=component, effects="unknown").as_data()

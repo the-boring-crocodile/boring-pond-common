@@ -1,6 +1,6 @@
 """Scenarios as an operator meets them: first deploy, upgrade, same version,
 refusals, rollback, data generations; venv and docker runtimes against fake
-systemctl/docker on PATH (they log their calls)."""
+systemctl/docker in a synthetic trusted tool directory (they log calls)."""
 import io
 import json
 import os
@@ -42,7 +42,7 @@ def env(tmp_path, monkeypatch):
     for name in ("systemctl", "docker"):
         (bin_dir / name).write_text(FAKE)
         (bin_dir / name).chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(boring_deploy, "SYSTEM_TOOL_PATH", f"{bin_dir}:/usr/sbin:/usr/bin:/sbin:/bin")
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "calls.log"))
     monkeypatch.setenv("FAKE_STATE", str(tmp_path / "state"))
     monkeypatch.setenv("BORING_DEPLOY_TEST", "1")
@@ -129,6 +129,17 @@ def deploy(directory, steps, *argv):
     return code, out.getvalue() + err.getvalue()
 
 
+def test_component_completion_distinguishes_runtime_only_install(env):
+    tmp, home = env
+    steps = Steps(units=[])
+    steps.completion = lambda ctx: "runtime installed; site not configured yet"
+    code, out = deploy(build(tmp, "1.0.0"), steps, str(home))
+    assert code == 0, out
+    assert "7 record  thing 1.0.0 runtime installed; site not configured yet" in out
+    assert "is live" not in out
+    assert steps.calls == ["check", "smoke"]
+
+
 def test_first_deploy_upgrade_and_rollback(env):
     tmp, home = env
     steps = Steps()
@@ -183,6 +194,178 @@ def test_check_is_read_only(env, runtime):
         assert [c for c in calls(tmp)[seen:] if c.split()[:2] != ["systemctl", "is-active"]] == []
         assert steps.calls == []
     assert not any("1.1.0" in c for c in calls(tmp))  # never built, tagged or started
+
+
+@pytest.mark.parametrize("argv", [(), ("--check",)])
+def test_preflight_reports_all_problems_before_install_or_prepare(env, monkeypatch, argv):
+    from types import SimpleNamespace
+    tmp, home = env
+    events = []
+    steps = Steps()
+    steps.preflight = lambda ctx: events.append("preflight") or ["first problem", "second problem"]
+    installer = SimpleNamespace(add_options=lambda *args: None,
+                                step_zero=lambda *args: events.append("install") or True)
+    monkeypatch.setattr(boring_deploy, "_installer", lambda: installer)
+    before = snapshot(home)
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = boring_deploy.main(build(tmp, "1.0.0"), steps, [str(home), *argv], install=object())
+    assert code == 1
+    assert "first problem" in out.getvalue() and "second problem" in out.getvalue()
+    assert "2 preflight problems" in err.getvalue()
+    assert "CHANGELOG Upgrade notes" in err.getvalue()
+    assert events == ["preflight"] and steps.calls == []
+    assert snapshot(home) == before and calls(tmp) == []
+
+
+@pytest.mark.parametrize("with_hook", [False, True])
+def test_optional_preflight_preserves_existing_install_and_generation_order(env, monkeypatch, with_hook):
+    from types import SimpleNamespace
+    tmp, home = env
+    events = []
+    steps = Steps()
+    steps.data_generation = lambda ctx: events.append("generation")
+    if with_hook:
+        steps.preflight = lambda ctx: events.append("preflight") or []
+    installer = SimpleNamespace(add_options=lambda *args: None,
+                                step_zero=lambda *args: events.append("install") or True)
+    monkeypatch.setattr(boring_deploy, "_installer", lambda: installer)
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = boring_deploy.main(build(tmp, "1.0.0"), steps, [str(home), "--check"], install=object())
+    assert code == 0, err.getvalue()
+    assert events == (["preflight"] if with_hook else []) + ["install", "generation"]
+    assert snapshot(home) == {} and steps.calls == []
+
+
+@pytest.mark.parametrize("value", [None, "problem", [1]])
+def test_invalid_preflight_reply_is_reported_before_changes(env, value):
+    tmp, home = env
+    steps = Steps()
+    steps.preflight = lambda ctx: value
+    code, out = deploy(build(tmp, "1.0.0"), steps, str(home), "--check")
+    assert code == 1 and "preflight must return a list" in out
+    assert snapshot(home) == {} and steps.calls == []
+
+
+@pytest.mark.parametrize("runtime", ["venv", "docker"])
+def test_artifact_records_glibc_floor_only_for_venv(env, runtime):
+    tmp, _ = env
+    directory = build(tmp, "1.0.0", runtime=runtime, glibc_min="9.99")
+    metadata = json.loads((directory / "RELEASE.json").read_text())
+    assert metadata["architecture"] == "x86_64"
+    assert boring_deploy.Release.load(directory).architecture == "x86_64"
+    if runtime == "venv":
+        assert metadata["glibc_min"] == "2.39"
+        assert boring_deploy.Release.load(directory).glibc_min == "2.39"
+    else:
+        assert "glibc_min" not in metadata
+        assert boring_deploy.Release.load(directory).glibc_min is None
+
+
+@pytest.mark.parametrize("argv", [(), ("--check",)])
+def test_docker_release_does_not_probe_host_glibc(env, monkeypatch, argv):
+    tmp, home = env
+    def no_probe(name):
+        pytest.fail("the Docker runtime does not use the host glibc")
+    monkeypatch.setattr(os, "confstr", no_probe)
+    directory = build(tmp, "1.0.0", runtime="docker")
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    code, out = deploy(directory, Steps(), str(home), *argv)
+    assert code == 0, out
+
+
+@pytest.mark.parametrize("argv", [(), ("--check",)])
+def test_old_glibc_refuses_check_and_deploy_before_prepare(env, monkeypatch, argv):
+    tmp, home = env
+    monkeypatch.setattr(os, "confstr", lambda name: "glibc 2.38")
+    directory = build(tmp, "1.0.0")
+    before = snapshot(home)
+    steps = Steps()
+    code, out = deploy(directory, steps, str(home), *argv)
+    assert code == 1 and "glibc 2.39" in out and "glibc 2.38" in out, out
+    assert "2 prepare" not in out and steps.calls == []
+    assert snapshot(home) == before and calls(tmp) == []
+
+
+@pytest.mark.parametrize("version", ["2.39", "2.40", "2.100"])
+def test_equal_or_newer_glibc_is_accepted(env, monkeypatch, version):
+    tmp, home = env
+    monkeypatch.setattr(os, "confstr", lambda name: "glibc " + version)
+    code, out = deploy(build(tmp, "1.0.0"), Steps(), str(home), "--check")
+    assert code == 0 and "nothing written" in out, out
+
+
+@pytest.mark.parametrize("argv", [(), ("--check",)])
+def test_legacy_release_without_glibc_field_skips_host_probe(env, monkeypatch, argv):
+    import hashlib
+    tmp, home = env
+    directory = build(tmp, "1.0.0")
+    # Fixture representing an old artifact, including its matching manifest.
+    path = directory / "RELEASE.json"
+    metadata = json.loads(path.read_text())
+    del metadata["glibc_min"]
+    path.write_text(json.dumps(metadata))
+    manifest = directory / "MANIFEST.sha256"
+    manifest.write_text("\n".join(
+        hashlib.sha256(path.read_bytes()).hexdigest() + "  RELEASE.json"
+        if line.endswith("  RELEASE.json") else line
+        for line in manifest.read_text().splitlines()) + "\n")
+    def no_probe(name):
+        pytest.fail("a legacy release must not probe glibc")
+    monkeypatch.setattr(os, "confstr", no_probe)
+    assert boring_deploy.Release.load(directory).glibc_min is None
+    code, out = deploy(directory, Steps(), str(home), *argv)
+    assert code == 0, out
+
+
+@pytest.mark.parametrize("answer", [None, "", "musl 1.2"])
+def test_unknown_glibc_refuses_a_new_artifact(env, monkeypatch, answer):
+    tmp, home = env
+    monkeypatch.setattr(os, "confstr", lambda name: answer)
+    code, out = deploy(build(tmp, "1.0.0"), Steps(), str(home), "--check")
+    assert code == 1 and "glibc 2.39" in out and "unknown" in out, out
+
+
+@pytest.mark.parametrize("floor", [None, True, 2.39, "2", "2.39.1", "bad"])
+def test_release_rejects_malformed_glibc_requirement(tmp_path, floor):
+    metadata = {"component": "thing", "version": "1.0.0", "runtime": "venv",
+                "default_home": "/unused", "glibc_min": floor}
+    (tmp_path / "RELEASE.json").write_text(json.dumps(metadata))
+    with pytest.raises(boring_deploy.Failure, match="glibc_min"):
+        boring_deploy.Release.load(tmp_path)
+
+
+@pytest.mark.parametrize("argv", [(), ("--check",)])
+def test_wrong_architecture_refuses_before_first_install_planning(env, monkeypatch, argv):
+    from types import SimpleNamespace
+    tmp, home = env
+    monkeypatch.setattr(boring_deploy.platform, "machine", lambda: "aarch64")
+    def unexpected(*args):
+        pytest.fail("first-install planning must not run for a wrong-architecture artifact")
+    monkeypatch.setattr(boring_deploy, "_installer", lambda: SimpleNamespace(
+        add_options=lambda *args: None, step_zero=unexpected))
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = boring_deploy.main(build(tmp, "1.0.0"), Steps(), [str(home), *argv], install=object())
+    assert code == 1 and "artifact architecture is x86_64" in err.getvalue()
+    assert "host architecture is aarch64" in err.getvalue()
+    assert snapshot(home) == {} and calls(tmp) == []
+
+
+def test_glibc_refusal_precedes_first_install(env, monkeypatch):
+    from types import SimpleNamespace
+    tmp, home = env
+    monkeypatch.setattr(os, "confstr", lambda name: "glibc 2.38")
+    def unexpected(*args):
+        pytest.fail("first install must not run on an unsupported host")
+    monkeypatch.setattr(boring_deploy, "_installer", lambda: SimpleNamespace(
+        add_options=lambda *args: None, step_zero=unexpected))
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = boring_deploy.main(build(tmp, "1.0.0"), Steps(), [str(home)], install=object())
+    assert code == 1 and "glibc 2.38" in err.getvalue()
+    assert snapshot(home) == {}
 
 
 def test_check_refuses_what_the_deploy_would_and_names_a_data_change(env):
@@ -251,6 +434,57 @@ def test_same_version_with_different_files_is_refused(env):
     assert snapshot(home) == before
 
 
+def test_docker_same_version_keeps_distinct_previous_and_rollback_image(env, monkeypatch):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    monkeypatch.setenv("FAKE_TAGS", "1.0.0 1.1.0")
+    first, second = build(tmp, "1.0.0", runtime="docker"), build(tmp, "1.1.0", runtime="docker")
+    for release in (first, second, second):
+        code, out = deploy(release, Steps(), str(home))
+        assert code == 0, out
+    assert (home / "release" / "VERSION").read_text().strip() == "1.1.0"
+    assert (home / "release.previous" / "VERSION").read_text().strip() == "1.0.0"
+    assert "back to 1.0.0" in out
+    assert "docker image rm boring-thing:1.0.0" not in calls(tmp)
+    code, out = deploy(home / "release.previous", Steps(), str(home))
+    assert code == 0, out
+    assert (home / "release" / "VERSION").read_text().strip() == "1.0.0"
+    assert (home / "release.previous" / "VERSION").read_text().strip() == "1.1.0"
+    assert (home / boring_deploy.IMAGE_ENV).read_text() == "BORING_IMAGE=boring-thing:1.0.0\n"
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0"])
+def test_docker_refuses_rebuilt_current_or_previous_version_before_build(env, version):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    for deployed in ("1.0.0", "1.1.0"):
+        code, out = deploy(build(tmp, deployed, runtime="docker"), Steps(), str(home))
+        assert code == 0, out
+    other = build(tmp, version, runtime="docker", note="rebuilt")
+    before, commands = snapshot(home), calls(tmp)
+    code, out = deploy(other, Steps(), str(home))
+    assert code == 1 and "different files" in out and "tag a new one" in out
+    assert snapshot(home) == before and calls(tmp) == commands
+
+
+@pytest.mark.parametrize("runtime", ["venv", "docker"])
+def test_failed_check_retains_prepared_release_without_claiming_no_writes(env, runtime):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    assert deploy(build(tmp, "1.0.0", runtime=runtime), Steps(), str(home))[0] == 0
+    class BadCheck(Steps):
+        def check(self, ctx):
+            raise boring_deploy.Failure("candidate check failed")
+    code, out = deploy(build(tmp, "1.1.0", runtime=runtime), BadCheck(), str(home))
+    assert code == 1 and "candidate check failed" in out
+    assert "nothing that runs changed; the prepared release stays for the next attempt" in out
+    assert "nothing changed:" not in out
+    prepared = home / ("release.new" if runtime == "docker" else "releases/1.1.0")
+    current = home / ("release" if runtime == "docker" else "current")
+    assert (prepared / "VERSION").read_text().strip() == "1.1.0"
+    assert (current / "VERSION").read_text().strip() == "1.0.0"
+
+
 def test_requires(env):
     tmp, home = env
     other = tmp / "croc"
@@ -263,6 +497,22 @@ def test_requires(env):
     assert snapshot(home) == before
     (other / "current" / "VERSION").write_text("0.4.5\n")
     assert deploy(build(tmp, "1.0.0", requires={"boring-crocodile": ">=0.4.5"}), Steps(), str(home))[0] == 0
+
+
+@pytest.mark.parametrize("installed", ["0.4.21", "0.6.0"])
+def test_minor_line_requires_refuses_before_prepare_or_switch(env, installed):
+    tmp, home = env
+    other = tmp / "croc"
+    (other / "current").mkdir(parents=True)
+    (other / "current" / "VERSION").write_text(installed + "\n")
+    boring_deploy.HOMES.write_text(json.dumps({"boring-crocodile": str(other)}))
+    before = snapshot(home)
+    steps = Steps()
+    release = build(tmp, "1.0.0", requires={"boring-crocodile": ">=0.5.0,<0.6"})
+    code, out = deploy(release, steps, str(home))
+    assert code == 1 and "needs boring-crocodile >=0.5.0,<0.6" in out
+    assert snapshot(home) == before
+    assert steps.calls == []
 
 
 def test_data_generations(env, monkeypatch):
@@ -343,6 +593,48 @@ def test_a_unit_that_fails_names_the_rollback(env):
     assert (home / "previous" / "bin" / "python3").exists()
 
 
+@pytest.mark.parametrize("runtime", ["venv", "docker"])
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("own", [None, "follow the component's recovery procedure"])
+def test_component_way_back_replaces_the_hint_on_success_and_failure(env, runtime, failed, own):
+    tmp, home = env
+    if runtime == "docker":
+        (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    assert deploy(build(tmp, "1.0.0", runtime=runtime), Steps(), str(home))[0] == 0
+    seen = []
+    steps = Steps()
+    steps.way_back = lambda ctx, previous: seen.append(previous.resolve()) or own
+    if failed:
+        steps.smoke = lambda ctx: (_ for _ in ()).throw(boring_deploy.Failure("synthetic smoke failure"))
+    code, out = deploy(build(tmp, "1.1.0", runtime=runtime), steps, str(home))
+    assert code == int(failed)
+    previous = home / boring_deploy.RUNTIMES[runtime].PREVIOUS
+    assert seen == [previous.resolve()]
+    normal = f"back to 1.0.0: sudo {previous}/deploy {home}"
+    assert (own or normal) in out
+    if own is not None:
+        assert normal not in out
+
+
+def test_first_install_has_no_way_back_hook(env):
+    tmp, home = env
+    steps = Steps()
+    steps.way_back = lambda ctx, previous: pytest.fail("no retained release")
+    assert deploy(build(tmp, "1.0.0"), steps, str(home))[0] == 0
+
+
+def test_a_failed_way_back_hook_preserves_the_deploy_failure_without_a_false_command(env):
+    tmp, home = env
+    assert deploy(build(tmp, "1.0.0"), Steps(), str(home))[0] == 0
+    steps = Steps()
+    steps.smoke = lambda ctx: (_ for _ in ()).throw(boring_deploy.Failure("synthetic smoke failure"))
+    steps.way_back = lambda ctx, previous: (_ for _ in ()).throw(boring_deploy.Failure("recovery unreadable"))
+    code, out = deploy(build(tmp, "1.1.0"), steps, str(home))
+    assert code == 1 and "FAILED at smoke: synthetic smoke failure" in out
+    assert "way back unavailable: recovery unreadable" in out
+    assert "sudo" not in out
+
+
 def test_docker_runtime(env):
     tmp, home = env
     (home / "compose.yaml").write_text("services:\n  svc:\n    image: boring-thing:0.0.1\n")
@@ -352,15 +644,52 @@ def test_docker_runtime(env):
     (home / ".env").write_text("SOURCECACHE_UID=1\n")
     assert deploy(build(tmp, "1.0.0", runtime="docker"), Steps(), str(home))[0] == 0
     assert deploy(build(tmp, "1.1.0", runtime="docker"), Steps(), str(home))[0] == 0
-    assert (home / ".env").read_text() == "SOURCECACHE_UID=1\nBORING_IMAGE=boring-thing:1.1.0\n"
+    assert (home / ".env").read_text() == "SOURCECACHE_UID=1\n"
+    assert (home / "boring-image.env").read_text() == "BORING_IMAGE=boring-thing:1.1.0\n"
     assert (home / "release" / "VERSION").read_text() == "1.1.0\n"
     assert (home / "release.previous" / "VERSION").read_text() == "1.0.0\n"
     code, out = deploy(home / "release.previous", Steps(), str(home))
     assert code == 0, out
-    assert (home / ".env").read_text().endswith("BORING_IMAGE=boring-thing:1.0.0\n")
+    assert (home / "boring-image.env").read_text().endswith("BORING_IMAGE=boring-thing:1.0.0\n")
+    assert (home / ".env").read_text() == "SOURCECACHE_UID=1\n"
     assert (home / "release" / "VERSION").read_text() == "1.0.0\n"
     calls = (tmp / "calls.log").read_text()
     assert "docker build --quiet -t boring-thing:1.1.0" in calls and "compose -f" in calls
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o400])
+def test_docker_migrates_only_its_image_line_and_keeps_private_operator_env(env, mode):
+    tmp, home = env
+    (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
+    original = b"# operator\r\nTOKEN=synthetic-secret\r\nBORING_IMAGE=old:1\r\nOTHER=x"
+    operator = home / ".env"
+    operator.write_bytes(original)
+    operator.chmod(mode)
+    owner = (operator.stat().st_uid, operator.stat().st_gid)
+    release = build(tmp, "1.0.0", runtime="docker")
+    assert deploy(release, Steps(), str(home), "--check")[0] == 0
+    assert operator.read_bytes() == original and stat.S_IMODE(operator.stat().st_mode) == mode
+    code, out = deploy(release, Steps(), str(home))
+    assert code == 0, out
+    assert operator.read_bytes() == b"# operator\r\nTOKEN=synthetic-secret\r\nOTHER=x"
+    assert stat.S_IMODE(operator.stat().st_mode) == mode
+    assert (operator.stat().st_uid, operator.stat().st_gid) == owner
+    assert (home / boring_deploy.IMAGE_ENV).read_text() == "BORING_IMAGE=boring-thing:1.0.0\n"
+    command = boring_deploy.compose_command(home, "up", "-d")
+    assert command[-6:] == ["--env-file", str(operator), "--env-file", str(home / boring_deploy.IMAGE_ENV), "up", "-d"]
+
+
+def test_image_migration_keeps_an_empty_env_file_and_does_not_touch_unowned_lines(tmp_path):
+    path = tmp_path / ".env"
+    path.write_bytes(b"BORING_IMAGE=old:1\n")
+    path.chmod(0o600)
+    boring_deploy.migrate_image_env(path)
+    assert path.exists() and path.read_bytes() == b""
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    path.write_bytes(b"export BORING_IMAGE=operator\n# BORING_IMAGE=comment\nSECRET=x")
+    before = path.stat()
+    boring_deploy.migrate_image_env(path)
+    assert path.stat().st_ino == before.st_ino and path.stat().st_mtime_ns == before.st_mtime_ns
 
 
 def test_docker_build_context_has_fresh_mtimes(env):
@@ -400,7 +729,7 @@ EXITED = '{"Service":"svc","State":"exited","Health":""}\n'
 
 @pytest.mark.parametrize("stack", [EXITED, "", "[" + EXITED.strip() + "]"])  # stopped, down, older Compose
 def test_an_update_leaves_a_stopped_docker_stack_stopped(env, stack):
-    """`compose stop` (or down) holds across updates: the new image goes into .env,
+    """`compose stop` (or down) holds across updates: the new image goes into boring-image.env,
     nothing is brought up, start and smoke are skipped and said so."""
     tmp, home = env
     (home / "compose.yaml").write_text("services:\n  svc:\n    image: ${BORING_IMAGE}\n")
@@ -411,10 +740,11 @@ def test_an_update_leaves_a_stopped_docker_stack_stopped(env, stack):
     code, out = deploy(build(tmp, "1.1.0", runtime="docker"), steps, str(home))
     assert code == 0, out
     assert "site is stopped: not started" in out and "smoke  skipped" in out
-    assert f"1.1.0 is installed, not started (start it with docker compose -f {home}/compose.yaml up -d)" in out
+    assert f"1.1.0 is installed, not started (start it with docker compose -f {home}/compose.yaml --env-file {home}/boring-image.env up -d)" in out
     assert not [c for c in calls(tmp)[seen:] if " up " in f"{c} "]
     assert steps.calls == ["check", "smoke", "check"]
-    assert (home / ".env").read_text() == "BORING_IMAGE=boring-thing:1.1.0\n"
+    assert not (home / ".env").exists()
+    assert (home / "boring-image.env").read_text() == "BORING_IMAGE=boring-thing:1.1.0\n"
     assert (home / "release" / "VERSION").read_text() == "1.1.0\n"
     assert (home / "DEPLOYED").read_text().splitlines()[-1].split()[1:4] == ["deploy", "thing", "1.1.0"]
 
@@ -468,7 +798,7 @@ def test_docker_units_refuse_an_unnamed_service_with_the_image(env):
     code, out = deploy(build(tmp, "1.0.0", runtime="docker"), Steps(units=["svc"]), str(home))
     assert code == 1 and "worker also use ${BORING_IMAGE}" in out and "backend" not in out.split("FAILED")[1], out
     assert not (home / ".env").exists() and not [c for c in calls(tmp) if " up " in f"{c} "]
-    assert "nothing changed" in out
+    assert "nothing that runs changed; the prepared release stays for the next attempt" in out
 
 
 def test_docker_units_stopped_front_end_stays_stopped(env):
@@ -578,11 +908,11 @@ def test_an_unsafe_lock_folder_is_refused(env):
     assert code == 1 and "unsafe lock folder" in out and not (home / "releases").exists()
 
 
-def test_the_launcher_refuses_python_older_than_3_11(env, monkeypatch):
+def test_the_launcher_refuses_python_older_than_3_12(env, monkeypatch):
     """One clear line, before the engine or the steps are imported."""
     tmp, _ = env
     release = build(tmp, "1.0.0")
-    monkeypatch.setattr(sys, "version_info", (3, 10, 12, "final", 0))
+    monkeypatch.setattr(sys, "version_info", (3, 11, 17, "final", 0))
 
     def no_exec(*args):
         raise AssertionError("went on past the version check")
@@ -591,22 +921,21 @@ def test_the_launcher_refuses_python_older_than_3_11(env, monkeypatch):
         source = (release / name).read_text()
         with pytest.raises(SystemExit) as stop:
             exec(compile(source, str(release / name), "exec"), {"__name__": "__main__", "__file__": str(release / name)})
-        assert stop.value.code == "python3 3.11 or newer is needed to run this; this is python3 3.10"
+        assert stop.value.code == "python3 3.12 or newer is needed to run this; this is python3 3.11"
 
 
-OLD_PYTHONS = sorted(Path.home().glob(".local/share/uv/python/cpython-3.10*/bin/python3.10"))
+OLD_PYTHONS = sorted(Path.home().glob(".local/share/uv/python/cpython-3.11*/bin/python3.11"))
 
 
-@pytest.mark.skipif(not OLD_PYTHONS, reason="no Python 3.10 here (uv python install 3.10)")
-def test_the_launcher_under_a_real_python_3_10(env):
+@pytest.mark.skipif(not OLD_PYTHONS, reason="no Python 3.11 here (uv python install 3.11)")
+def test_the_launcher_under_a_real_python_3_11(env):
     tmp, _ = env
     release = build(tmp, "1.0.0")
     result = subprocess.run([str(OLD_PYTHONS[0]), str(release / "deploy"), "--help"], capture_output=True, text=True)
     assert result.returncode == 1 and result.stdout == ""
-    assert result.stderr == "python3 3.11 or newer is needed to run this; this is python3 3.10\n"
+    assert result.stderr == "python3 3.12 or newer is needed to run this; this is python3 3.11\n"
 
 
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 def test_artifact_is_reproducible_and_launcher_runs(env):
     tmp, _ = env
     first, second = build(tmp, "1.0.0"), build(tmp, "1.0.0")
@@ -664,7 +993,21 @@ def test_python_tarball_needs_the_licence_notices(tmp_path, monkeypatch):
     assert artifact.python_notices(top, "3.14.8") == kept
 
 
-def test_install_app_unpacks_python_with_service_modes(tmp_path):
+def test_install_app_rejects_archive_paths_outside_the_unpack_directory(tmp_path):
+    target = tmp_path / "release"
+    target.mkdir()
+    with tarfile.open(target / "python.tar.gz", "w:gz") as tar:
+        tar.addfile(tarfile.TarInfo("../escaped"))
+    release = boring_deploy.Release(target, "thing", "1.0.0", "venv", "/nonexistent",
+                                    details={"python": "python.tar.gz"})
+    ctx = boring_deploy.Context(release, tmp_path, None, lambda message: None)
+    with pytest.raises(tarfile.OutsideDestinationError):
+        boring_deploy.install_app(ctx, target)
+    assert not (target / "escaped").exists()
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_install_app_unpacks_python_with_service_modes(tmp_path, monkeypatch):
     source = tmp_path / "src" / "python"
     (source / "bin").mkdir(parents=True)
     (source / "lib").mkdir()
@@ -683,6 +1026,18 @@ def test_install_app_unpacks_python_with_service_modes(tmp_path):
     ctx = boring_deploy.Context(release, tmp_path, None, lambda message: None)
     calls = []
     ctx.run = lambda *command, **kw: calls.append(command)
+    symlink_to = Path.symlink_to
+    def interrupt_link(path, destination, **options):
+        if path == target / "bin":
+            assert not (target / "app" / boring_deploy.COMPLETE).exists()
+            raise OSError("interrupted before bin publication")
+        return symlink_to(path, destination, **options)
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(Path, "symlink_to", interrupt_link)
+        with pytest.raises(OSError, match="before bin publication"):
+            boring_deploy.install_app(ctx, target)
+    assert not (target / "app" / boring_deploy.COMPLETE).exists()
+    calls.clear()
     boring_deploy.install_app(ctx, target)
     app = target / "app"
     python = str(app / "bin" / "python3")
@@ -701,6 +1056,27 @@ def test_install_app_unpacks_python_with_service_modes(tmp_path):
     assert calls[2] == (python, "-I", "-m", "pip", "check")
     assert calls[3][:3] == (python, "-I", "-c") and "compileall" in calls[3][3]
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("prior", ["absent", "wrong-link", "file"])
+def test_prepare_repairs_an_old_completion_marker_without_bin(tmp_path, prior):
+    target = tmp_path / "releases/1.0.0"
+    (target / "app/bin").mkdir(parents=True)
+    (target / "app/bin/python3").write_text("completed runtime fixture")
+    (target / "app" / boring_deploy.COMPLETE).write_text("1.0.0\n")
+    if prior == "wrong-link":
+        (target / "bin").symlink_to("elsewhere")
+    elif prior == "file":
+        (target / "bin").write_text("foreign entry")
+    release = boring_deploy.Release(target, "thing", "1.0.0", "venv", "/nonexistent")
+    ctx = boring_deploy.Context(release, tmp_path, None, lambda message: None)
+    if prior != "absent":
+        with pytest.raises(boring_deploy.Failure, match="unexpected bin link"):
+            boring_deploy.Venv().prepare(ctx)
+        return
+    boring_deploy.Venv().prepare(ctx)
+    assert (target / "bin/python3").read_text() == "completed runtime fixture"
+    assert os.readlink(target / "bin") == "app/bin"
 
 
 def test_versions():
@@ -774,3 +1150,23 @@ def test_a_step_command_never_reads_the_operators_stdin(tmp_path):
         os.dup2(saved, 0)
         for fd in (saved, read_end):
             os.close(fd)
+
+
+def test_home_check_refuses_writable_ancestry_before_install(tmp_path):
+    from boring_deploy import Failure, check_home_path
+
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    parent.chmod(0o775)
+    with pytest.raises(Failure, match=r"shared.*permits another writer"):
+        check_home_path(parent / "component", missing_ok=True)
+    parent.chmod(0o755)
+    home = parent / "component"
+    home.mkdir()
+    # HOME's contents belong to the component. Do not walk service-owned data.
+    (home / "service-config").symlink_to("/some/component/path")
+    check_home_path(home)
+    alias = parent / "alias"
+    alias.symlink_to(home, target_is_directory=True)
+    with pytest.raises(Failure, match=r"unsafe component HOME .*alias"):
+        check_home_path(alias)

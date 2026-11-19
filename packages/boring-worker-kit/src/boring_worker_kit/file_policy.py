@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from boring_file_core import parts
-from .inputs import integer, table, text
+from .validation import integer, table, text
 
 _ID = re.compile(r"[a-z][a-z0-9-]{0,62}\Z")
 _LIMITS = {

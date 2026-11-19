@@ -19,12 +19,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
+from . import LINUX_GLIBC_FLOOR
+
 # python-build-standalone releases the artifacts ship, pinned per target Python.
-PYTHONS = {"3.14": "3.14.8", "3.12": "3.12.15", "3.10": "3.10.22"}
-# Linux wheel tags a release may use, newest first.
-LINUX_PLATFORMS = ("manylinux_2_39_x86_64", "manylinux2014_x86_64", "linux_x86_64")
+PYTHONS = {"3.14": "3.14.8", "3.12": "3.12.15"}
+# pip matches explicit --platform tags exactly; enumerate every compatible
+# PEP 600 x86_64 tag down to the oldest manylinux2014 baseline (glibc 2.17).
+LINUX_PLATFORMS = tuple(
+    f"manylinux_{LINUX_GLIBC_FLOOR[0]}_{minor}_x86_64"
+    for minor in range(LINUX_GLIBC_FLOOR[1], 16, -1)
+) + ("manylinux2014_x86_64", "linux_x86_64")
 
 
 def run(*command: object, **kwargs) -> subprocess.CompletedProcess:
@@ -71,11 +78,24 @@ def tracked(root: Path, target: Path, sub: str = ".") -> Path:
 
 
 def package(root: Path, target: Path, sub: str = ".") -> Path:
-    """Copy one package's tracked src/, pyproject.toml and README.md: what a wheel is built from."""
-    names = git(root, "ls-files", "-z", "--", sub).split("\0")
-    for name in filter(None, names):
+    """Copy tracked package sources and the licence files its pyproject declares."""
+    names = list(filter(None, git(root, "ls-files", "-z", "--", sub).split("\0")))
+    base = root / sub
+    tracked_files = {Path(name).relative_to(sub) for name in names}
+    with (base / "pyproject.toml").open("rb") as handle:
+        patterns = tomllib.load(handle).get("project", {}).get("license-files", [])
+    licences = set()
+    for pattern in patterns:
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            raise ValueError(f"license-files pattern must stay inside the package: {pattern!r}")
+        found = {path.relative_to(base) for path in base.glob(pattern)
+                 if path.is_file() and path.relative_to(base) in tracked_files}
+        if not found:
+            raise ValueError(f"license-files pattern matches no tracked file: {pattern!r}")
+        licences.update(found)
+    for name in names:
         relative = Path(name).relative_to(sub)
-        if relative.parts[0] in ("src", "pyproject.toml", "README.md"):
+        if relative.parts[0] in ("src", "pyproject.toml", "README.md") or relative in licences:
             (target / relative).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target / relative)
     return target
@@ -136,7 +156,7 @@ def lock_arguments(doc: str) -> argparse.ArgumentParser:
 
 
 def lock(args: argparse.Namespace, output: Path, inputs: list[Path], *, find_links: list[Path] = (),
-         no_emit: list[str] = (), python_version: str = "3.10", extra: list[str] = (),
+         no_emit: list[str] = (), python_version: str = "3.12", extra: list[str] = (),
          how: str = "python scripts/lock.py --common-wheels <Common dist>") -> None:
     """uv pip compile: one universal lock with hashes; Common from args.common_wheels.
     `how` is the command the lock's header names for regenerating it."""
@@ -160,7 +180,7 @@ def lock(args: argparse.Namespace, output: Path, inputs: list[Path], *, find_lin
 
 # --- build -----------------------------------------------------------------------
 
-# pip evaluates lock markers (python_full_version < '3.11', sys_platform == 'win32')
+# pip evaluates lock markers (python_full_version < '3.12', sys_platform == 'win32')
 # against the interpreter it runs on, not the --python-version/--platform target.
 # So the lock is filtered for the target first, with pip's own marker parser.
 TARGET_FILTER = r"""

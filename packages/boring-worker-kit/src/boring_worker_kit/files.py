@@ -11,9 +11,11 @@ import os
 import stat
 import time
 from contextlib import ExitStack, contextmanager
+from collections.abc import Callable
+from functools import partial
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, cast
+from typing import Iterator, TypeVar, cast
 
 from boring_file_core import (RESERVED_PREFIXES, InvalidPath, NotAllowedFile, NotAllowedMetadata, OutsideScope, StaleEdit, TooLarge,
                               atomic_write, digest, directory_fd, edit_metadata, parts, read_regular, root_fd,
@@ -23,21 +25,22 @@ from boring_file_core.textpatch import PatchError, apply_edits
 from .file_policy import FilePolicy, FileRoot
 from .batch_contracts import MAX_SEARCH_MATCHES, admit_single
 from .observation import Observation
-from .outcomes import Refusal
+from .outcomes import Refused
 from .inputs import integer, table, text
 
+_T = TypeVar("_T")
 _WRITES = frozenset({"file_write", "file_patch", "file_write_bytes"})
 
 
 def _binary(value: object) -> bytes:
     if not isinstance(value, str) or len(value) > 87384:
-        raise Refusal("limit", "base64 chunk exceeds input limit")
+        raise Refused("limit", "base64 chunk exceeds input limit")
     try:
         data = base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error):
-        raise Refusal("invalid_request", "data must be valid base64") from None
+        raise Refused("invalid_request", "data must be valid base64") from None
     if len(data) > 65536:
-        raise Refusal("limit", "byte chunk exceeds 65536 bytes")
+        raise Refused("limit", "byte chunk exceeds 65536 bytes")
     return data
 
 
@@ -48,7 +51,7 @@ def _hash(value: object, *, create: bool = False) -> str | None:
     if value is None and create:
         return None
     if not isinstance(value, str) or len(value) != 64 or any(c not in _HASH for c in value):
-        raise Refusal("invalid_request", "expected_sha256 must be a lowercase SHA-256 or null for creation")
+        raise Refused("invalid_request", "expected_sha256 must be a lowercase SHA-256 or null for creation")
     return value
 
 
@@ -58,32 +61,37 @@ def _text(value: object, name: str) -> str:
     try:
         return text(value, name, empty=True)
     except ValueError as error:
-        raise Refusal("invalid_request", str(error)) from None
+        raise Refused("invalid_request", str(error)) from None
 
 
 def _integer(value: object, name: str, minimum: int, maximum: int | None = None) -> int:
     try:
         return integer(value, name, minimum, maximum)
     except ValueError as error:
-        raise Refusal("invalid_request", str(error)) from None
+        raise Refused("invalid_request", str(error)) from None
 
 
 @contextmanager
-def _directory(root: int, components: tuple[str, ...]) -> Iterator[int]:
+def _directory(root: int, components: tuple[str, ...], *, write_operation: str | None = None) -> Iterator[int]:
     """Open a directory the caller named; its absence is an answer, not a failure."""
     with ExitStack() as stack:
         try:
             fd = stack.enter_context(directory_fd(root, components))
-        except FileNotFoundError:
-            raise Refusal("not_found", "directory does not exist") from None
+        except FileNotFoundError as error:
+            if write_operation is not None:
+                folder = error.filename or "/".join(components)
+                raise Refused("not_found", f"folder {folder!r} does not exist; "
+                              f"{write_operation} does not create folders; "
+                              "create it first or choose another path", path=folder) from None
+            raise Refused("not_found", "directory does not exist") from None
         except NotADirectoryError:
-            raise Refusal("invalid_request", "a path component is not a directory") from None
+            raise Refused("invalid_request", "a path component is not a directory") from None
         except PermissionError:
-            raise Refusal("forbidden", "directory is not accessible") from None
+            raise Refused("forbidden", "directory is not accessible") from None
         except OSError as error:
             if error.errno != errno.ELOOP:
                 raise
-            raise Refusal("forbidden", "a path component is a symbolic link") from None
+            raise Refused("forbidden", "path is a symbolic link; file tools do not follow links", kind="symlink") from None
         yield fd
 
 
@@ -92,15 +100,12 @@ def _read(parent: int, name: str, maximum: int, *, single_link: bool = False) ->
     try:
         return read_regular(parent, name, maximum, single_link=single_link)
     except NotAllowedFile as error:
-        raise Refusal("forbidden", str(error)) from None
+        raise Refused("forbidden", str(error), kind=error.kind) from None
     except TooLarge as error:
-        raise Refusal("limit", str(error)) from None
+        raise Refused("limit", str(error)) from None
     except PermissionError:
-        raise Refusal("forbidden", "file is not accessible") from None
-    except OSError as error:
-        if error.errno != errno.ELOOP:  # O_NOFOLLOW: the file is a symbolic link
-            raise
-        raise Refusal("forbidden", "file is not an allowed regular file") from None
+        raise Refused("forbidden", "file is not accessible") from None
+
 
 
 def _current_sha256(parent: int, name: str, maximum: int) -> str | None:
@@ -108,7 +113,7 @@ def _current_sha256(parent: int, name: str, maximum: int) -> str | None:
     not a readable plain file (the refusal stays `stale` either way)."""
     try:
         return digest(_read(parent, name, maximum)[0])
-    except (Refusal, OSError):
+    except (Refused, OSError):
         return None
 
 
@@ -138,7 +143,7 @@ def _target_lock(lock_dir: Path, parent: int, name: str) -> Iterator[None]:
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise Refusal("busy", "file edit lock deadline exceeded")
+                    raise Refused("busy", "file edit lock deadline exceeded")
                 time.sleep(.025)
         yield
     finally:
@@ -176,28 +181,28 @@ class FileTools:
         if operation == "file_write":
             _hash(args["expected_sha256"], create=True)
             if len(args["content"].encode("utf-8")) > limits["max_file_bytes"]:
-                raise Refusal("limit", "file exceeds write limit")
+                raise Refused("limit", "file exceeds write limit")
         elif operation == "file_write_bytes":
             _hash(args["expected_sha256"], create=True)
             if len(_binary(args["data"])) > limits["max_file_bytes"]:
-                raise Refusal("limit", "file exceeds write limit")
+                raise Refused("limit", "file exceeds write limit")
             if args["expected_sha256"] is None and args.get("offset") not in (None, 0):
-                raise Refusal("invalid_request", "a new file starts at offset 0")
+                raise Refused("invalid_request", "a new file starts at offset 0")
         elif operation == "file_read_bytes":
             if args.get("length", 16384) > max(0, (limits["max_output_bytes"] - 1024) // 4 * 3):
-                raise Refusal("limit", "byte range exceeds output budget")
+                raise Refused("limit", "byte range exceeds output budget")
         elif operation == "file_patch":
             _hash(args["expected_sha256"])
             if len(args["edits"]) > limits["max_edits"]:
-                raise Refusal("invalid_request", "invalid edit count")
+                raise Refused("invalid_request", "invalid edit count")
         elif operation == "file_list" and args.get("limit", 100) > limits["max_list_entries"]:
-            raise Refusal("limit", "listing limit exceeds policy")
+            raise Refused("limit", "listing limit exceeds policy")
         elif operation == "file_search":
             query = args["query"]
             if not query or "\r" in query or "\n" in query:
-                raise Refusal("invalid_request", "query must be nonempty single-line text")
+                raise Refused("invalid_request", "query must be nonempty single-line text")
             if len(query.encode("utf-8")) > 1024:
-                raise Refusal("limit", "query is too large")
+                raise Refused("limit", "query is too large")
         return args
 
     async def call(self, operation: str, request: dict[str, object],
@@ -206,15 +211,36 @@ class FileTools:
         try:
             prepared = self.prepare(operation, args)
         except (TextFormatError, UnicodeEncodeError) as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
         actual = {"operation": operation, "request_id": request.get("request_id", "direct"), **prepared}
+        return await self._in_pool(partial(self._observed_call, operation, actual, batch_id, step_id))
+
+    async def read_whole(self, root: str, path: str, max_bytes: int) -> tuple[bytes, str]:
+        """Read exact bytes and SHA-256 under read policy, with the caller's cap.
+
+        This internal primitive shares file-operation admission and containment;
+        it does not use max_file_bytes, decode images or publish a new tool.
+        """
+        maximum = _integer(max_bytes, "max_bytes", 1)
+        return await self._in_pool(partial(self._read_whole, root, path, maximum))
+
+    def _read_whole(self, root: str, path: str, maximum: int) -> tuple[bytes, str]:
+        _, policy, components = self._scope(root, path, False, False)
+        with root_fd(policy.path) as fd, _directory(fd, components[:-1]) as parent:
+            try:
+                data, _ = _read(parent, components[-1], maximum)
+            except FileNotFoundError:
+                raise Refused("not_found", "file does not exist") from None
+        return data, digest(data)
+
+    async def _in_pool(self, work: Callable[[], _T]) -> _T:
         # A cancelled caller must retain the slot until its thread has stopped.
         try:
             await asyncio.wait_for(self.slots.acquire(), timeout=5)
         except asyncio.TimeoutError:
-            raise Refusal("busy", "all file operation slots are in use") from None
+            raise Refused("busy", "all file operation slots are in use") from None
         future = asyncio.get_running_loop().run_in_executor(
-            self.pool, self._observed_call, operation, actual, batch_id, step_id)
+            self.pool, work)
         future.add_done_callback(lambda _: self.slots.release())
         return await asyncio.shield(future)
 
@@ -254,27 +280,27 @@ class FileTools:
 
     def _scope(self, root: object, path: object, write: bool, directory: bool) -> tuple[str, FileRoot, tuple[str, ...]]:
         if not isinstance(root, str) or root not in self.policy.roots:
-            raise Refusal("forbidden", "file root is unavailable")
+            raise Refused("forbidden", "file root is unavailable")
         policy = self.policy.roots[root]
         if not policy.read or (write and not policy.write):
-            raise Refusal("forbidden", "file operation is disabled for this root")
+            raise Refused("forbidden", "file operation is disabled for this root")
         if not isinstance(path, str):
-            raise Refusal("invalid_request", "path must be a string")
+            raise Refused("invalid_request", "path must be a string")
         try:
             p = parts(path, directory=directory, reserved=self.reserved)
         except InvalidPath as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
         except OutsideScope as error:
-            raise Refusal("forbidden", str(error)) from None
+            raise Refused("forbidden", str(error)) from None
         if any(p[:len(denied)] == denied for denied in policy.deny):
-            raise Refusal("forbidden", "path is outside file scope")
+            raise Refused("forbidden", "path is outside file scope")
         return root, policy, p
 
     def _call(self, operation: str, request: dict[str, object]) -> dict[str, object]:
         try:
             return self._file_call(operation, request)
         except (TextFormatError, UnicodeEncodeError) as error:
-            raise Refusal("invalid_request", str(error)) from None
+            raise Refused("invalid_request", str(error)) from None
 
     def _file_call(self, operation: str, request: dict[str, object]) -> dict[str, object]:
         fields = {
@@ -297,7 +323,7 @@ class FileTools:
                 try:
                     data, _ = _read(parent, p[-1], limits["max_file_bytes"])
                 except FileNotFoundError:
-                    raise Refusal("not_found", "file does not exist") from None
+                    raise Refused("not_found", "file does not exist") from None
             if operation == "file_read_bytes":
                 offset = _integer(args.get("offset", 0), "offset", 0)
                 length = _integer(args.get("length", 16384), "length", 1, 65536)
@@ -318,7 +344,7 @@ class FileTools:
                     break
                 selected.append(line); used += size
             if not selected and start <= len(lines):
-                raise Refusal("limit", "line exceeds output budget")
+                raise Refused("limit", "line exceeds output budget")
             next_line = start + len(selected)
             return {"content": "".join(selected), "sha256": digest(data), "bytes": len(data),
                     "start_line": start, "returned_lines": len(selected), "total_lines": len(lines),
@@ -327,26 +353,26 @@ class FileTools:
         if operation in _WRITES:
             expected = _hash(args["expected_sha256"], create=operation in ("file_write", "file_write_bytes"))
             if operation == "file_patch" and expected is None:
-                raise Refusal("invalid_request", "patch requires expected hash")
-            with root_fd(policy.path) as fd, _directory(fd, p[:-1]) as parent:
+                raise Refused("invalid_request", "patch requires expected hash")
+            with root_fd(policy.path) as fd, _directory(fd, p[:-1], write_operation=operation) as parent:
                 with _target_lock(self.lock_dir, parent, p[-1]):
                     try:
                         old, info = _read(parent, p[-1], limits["max_file_bytes"], single_link=True)
                     except FileNotFoundError:
                         if expected is not None:
-                            raise Refusal("stale", "stale edit: file is absent",
+                            raise Refused("stale", "stale edit: file is absent",
                                           current_sha256=None) from None
                         old, info = b"", None
                     if info is not None:
                         if expected != digest(old):
-                            raise Refusal("stale", "stale edit: expected hash differs",
+                            raise Refused("stale", "stale edit: expected hash differs",
                                           current_sha256=digest(old))
                         if info.st_mode & 0o7000 or info.st_uid != os.getuid():
-                            raise Refusal("forbidden", "file owner or privileged mode is not editable")
+                            raise Refused("forbidden", "file owner or privileged mode is not editable")
                         try:
                             metadata = edit_metadata(parent, p[-1], info)
                         except NotAllowedMetadata as error:
-                            raise Refusal("forbidden", str(error)) from None
+                            raise Refused("forbidden", str(error)) from None
                         mode = metadata.mode
                     else:
                         metadata = None
@@ -360,7 +386,7 @@ class FileTools:
                         else:
                             write_offset = _integer(write_offset, "offset", 0)
                             if write_offset > len(old):
-                                raise Refusal("invalid_request", "offset is past the end of the file")
+                                raise Refused("invalid_request", "offset is past the end of the file")
                             payload = old[:write_offset] + chunk + old[write_offset + len(chunk):]
                     elif operation == "file_write":
                         existing = decode(old).format if info is not None else None
@@ -371,7 +397,7 @@ class FileTools:
                     else:
                         edits = args["edits"]
                         if not isinstance(edits, list) or not 1 <= len(edits) <= limits["max_edits"]:
-                            raise Refusal("invalid_request", "invalid edit count")
+                            raise Refused("invalid_request", "invalid edit count")
                         decoded = decode(old)
                         pairs = []
                         for edit in edits:
@@ -381,11 +407,11 @@ class FileTools:
                         try:
                             value = apply_edits(decoded.text, pairs)
                         except PatchError as error:
-                            raise Refusal("invalid_request", str(error), **error.details) from None
+                            raise Refused("invalid_request", str(error), **error.details) from None
                         fmt = target_format(decoded.format, None, None, cast(str | None, args.get("newline")))
                         payload = encode(value, fmt)
                     if len(payload) > limits["max_file_bytes"]:
-                        raise Refusal("limit", "file exceeds write limit")
+                        raise Refused("limit", "file exceeds write limit")
                     try:
                         verify_target(parent, p[-1], expected, info, limits["max_file_bytes"], metadata)
                         atomic_write(parent, p[-1], payload, mode, create=info is None,
@@ -395,7 +421,7 @@ class FileTools:
                                                                             limits["max_file_bytes"], metadata))
                                      if info is not None else None)
                     except StaleEdit as error:
-                        raise Refusal("stale", str(error), current_sha256=_current_sha256(
+                        raise Refused("stale", str(error), current_sha256=_current_sha256(
                             parent, p[-1], limits["max_file_bytes"])) from None
                     result: dict[str, object] = {"sha256": digest(payload), "bytes": len(payload)}
                     if fmt is not None:
@@ -430,9 +456,9 @@ class FileTools:
                 return {"entries": entries, "truncated": False, "reason": None, "skipped": skipped}
             query = _text(args["query"], "query")
             if not query or "\n" in query or "\r" in query:
-                raise Refusal("invalid_request", "query must be nonempty single-line text")
+                raise Refused("invalid_request", "query must be nonempty single-line text")
             if len(query.encode("utf-8")) > 1024:
-                raise Refusal("limit", "query is too large")
+                raise Refused("limit", "query is too large")
             matches: list[dict[str, object]] = []
             state = SearchState()
             self._search(directory, p, policy, query, limit, 0, matches, state)

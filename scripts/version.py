@@ -6,7 +6,7 @@ each package's pyproject.toml, the internal dependency ranges and
 boring_service_kit.__version__, or (with --check) fails if anything disagrees.
 
     python scripts/version.py --check
-    python scripts/version.py 0.4.1      # set, then commit and tag v0.4.1
+    python scripts/version.py 0.8.0rc1  # set a candidate; commit without a tag
     python scripts/version.py 0.5.0.dev1 # a development version: commit, no tag
 """
 import argparse
@@ -15,14 +15,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGES = ("boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
+PACKAGES = ("boring-outcomes", "boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
 # Dependency entries only: indented list items such as `    "boring-registry>=0.4.0,<0.5",`.
-INTERNAL = re.compile(r'(?m)^(\s+)"(boring-(?:registry|file-core|service-kit|worker-kit))[^"]*"')
+INTERNAL = re.compile(r'(?m)^(\s+)"(boring-(?:outcomes|registry|file-core|service-kit|worker-kit))[^"]*"')
 SERVICE_KIT_INIT = ROOT / "packages/boring-service-kit/src/boring_service_kit/__init__.py"
 
 
 RELEASE = r"\d+\.\d+\.\d+"
-VERSION = re.compile(RELEASE + r"(?:\.dev\d+)?")  # 0.7.0, or 0.7.0.dev1 while a release is prepared
+VERSION = re.compile(RELEASE + r"(?:rc\d+|\.dev\d+)?")
 
 
 def internal_range(version):
@@ -51,7 +51,7 @@ def main():
     args = parser.parse_args()
     if args.version:
         if not VERSION.fullmatch(args.version):
-            raise SystemExit("version must be MAJOR.MINOR.PATCH, or MAJOR.MINOR.PATCH.devN")
+            raise SystemExit("version must be MAJOR.MINOR.PATCH, MAJOR.MINOR.PATCHrcN, or MAJOR.MINOR.PATCH.devN")
         (ROOT / "VERSION").write_text(args.version + "\n")
     version = (ROOT / "VERSION").read_text().strip()
     stale = [path for path, text in expected(version).items() if path.read_text() != text]

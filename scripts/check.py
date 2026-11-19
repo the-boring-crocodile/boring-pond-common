@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGES = ("boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
+PACKAGES = ("boring-outcomes", "boring-registry", "boring-file-core", "boring-service-kit", "boring-worker-kit", "boring-deploy")
 sys.path.insert(0, str(ROOT / "packages/boring-deploy/src"))  # the shared steps, from this tree
 from boring_deploy.develop import run, uv as find_uv  # noqa: E402
 
@@ -36,6 +36,10 @@ def main():
         run(uv, "pip", "install", "--quiet", "-r", ROOT / "requirements-dev.txt", *wheels, env=env)
         python = venv / "bin" / "python"
         failed = []
+        if subprocess.run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           ROOT / "scripts/test_version.py", ROOT / "scripts/test_family_vocabulary.py"],
+                           cwd=tmp).returncode:
+            failed.append("source checks")
         for name in PACKAGES:
             tests = ROOT / "packages" / name / "tests"
             # Copy tests out of the tree so imports resolve to the installed wheels.
@@ -45,6 +49,8 @@ def main():
                     target = copy / source.relative_to(tests)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target)  # contents only: source ACLs/xattrs do not travel
+            if name == "boring-deploy":
+                shutil.copyfile(ROOT / "scripts/build-constraints.txt", copy / "build-constraints.txt")
             print(f"== {name}", flush=True)
             if subprocess.run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", copy], cwd=tmp).returncode:
                 failed.append(name)

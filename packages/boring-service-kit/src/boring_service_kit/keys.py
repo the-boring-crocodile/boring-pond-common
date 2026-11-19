@@ -8,8 +8,10 @@ changes, so adding, renewing and removing keys take effect at the next call.
 A key produces the same verified caller as OAuth introspection --
 (issuer, subject, author, role) with the file's own issuer such as
 ``key:knowledge`` -- so reader/writer checks, attribution and ownership
-work unchanged. Keys are accepted over HTTPS, or plain HTTP on loopback only
-(enforced by ServiceConfig).
+work unchanged. The kit's HTTP listener must bind loopback, or explicitly
+acknowledge a trusted proxy on another host/container network with
+behind_proxy=true and restrict that port to the proxy (ServiceConfig).
+An HTTPS public URL alone does not secure the plaintext listener.
 
     boring-service-keys add --file keys.json --issuer key:knowledge \\
         --subject robin@devbox --role writer --days 90 --label "Robin, Visual Studio on the dev box"
@@ -39,7 +41,7 @@ from typing import Any, Callable
 
 from mcp.server.auth.provider import AccessToken
 
-from .access import Caller
+from .access import Caller, verified_caller
 
 log = logging.getLogger("boring_service_kit.keys")
 
@@ -263,9 +265,7 @@ class KeyVerifier:
         key = self._by_fingerprint.get(fingerprint(token))
         if key is None or self._file is None or key.expires <= self.clock():
             return None
-        issuer = self._file.issuer
-        author = json.dumps([issuer, key.subject], separators=(",", ":"))
-        return key, Caller(issuer, key.subject, author, key.role)
+        return key, verified_caller(self._file.issuer, key.subject, key.role)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         found = self.caller(token)
@@ -275,23 +275,6 @@ class KeyVerifier:
         return AccessToken(token=token, client_id=f"key:{key.id}", scopes=list(self.scopes),
                            expires_at=key.expires, resource=self.own_url, subject=caller.subject,
                            claims={"boring_caller": asdict(caller)})
-
-
-class EitherVerifier:
-    """Keys first (recognised by their prefix), then OAuth introspection when configured."""
-
-    def __init__(self, keys: KeyVerifier | None, introspection: Any | None) -> None:
-        if keys is None and introspection is None:
-            raise ValueError("configure oauth, keys or both")
-        self.keys = keys
-        self.introspection = introspection
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        if self.keys is not None and token.startswith(PREFIX):
-            return await self.keys.verify_token(token)
-        if self.introspection is not None:
-            return await self.introspection.verify_token(token)
-        return None
 
 
 # ---------------------------------------------------------------- administration

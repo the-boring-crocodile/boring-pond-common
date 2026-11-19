@@ -39,7 +39,7 @@ def compact(data: Any, is_error: bool = False) -> CallToolResult:
     The SDK's default would add an indented copy next to `structuredContent`;
     every result is re-sent on every later Copilot turn, so it costs twice,
     turn after turn. Refusals and failures are `isError` with the
-    outcome as JSON, the Pond's shape: `status`, `code`, `message`, `details`.
+    outcome as flat JSON, the Pond's shape: `status`, `code`, `message`, and flat detail fields.
     """
     text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return CallToolResult(content=[TextContent(type="text", text=text)], is_error=is_error)
@@ -55,7 +55,7 @@ def as_mcp_tool(fn: Callable[..., dict[str, Any]], log: CallLog) -> Callable[...
             log.record(fn.__name__, kwargs, "succeeded", None, started, len(result.content[0].text))
             return result
         except Outcome as outcome:
-            result = compact(outcome.as_dict(), is_error=True)
+            result = compact(outcome.as_data(), is_error=True)
             log.record(fn.__name__, kwargs, outcome.status, outcome.code, started, len(result.content[0].text))
             return result
         except Exception as exc:

@@ -30,7 +30,9 @@ Reality answers, never a record. The component's install steps
                                    rerun after a failure finishes the job
 
 Three answers from look: installed (deploy as usual), not installed (install,
-then the deploy's own steps), irregular (stop; nothing changes). A first install
+then the deploy's own steps), irregular (stop; nothing changes). A not-installed
+Look may also mark retained=True: --delete-data still calls uninstall to finish
+its recognized account/data cleanup; ordinary installation remains possible. A first install
 asks before it acts at a terminal and needs --install without one. Settings
 are refused once installed: the site's files are the operator's from then on.
 
@@ -50,10 +52,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 try:  # in the package
-    from . import Context, Failure, Release, homes, homes_update, installed_version, operation_lock, record
+    from . import Context, Failure, Release, homes, homes_update, installed_version, operation_lock, record, root_input
 except ImportError:  # in a release: deploy.d/boring_deploy.py
     from boring_deploy import (Context, Failure, Release, homes, homes_update,  # type: ignore[no-redef]
-                               installed_version, operation_lock, record)
+                               installed_version, operation_lock, record, root_input)
 _engine = __package__ or "boring_deploy"  # the engine module, by name
 
 
@@ -73,15 +75,13 @@ class Setting:
         return self.name.replace("-", "_")
 
     def check(self, value: str) -> str:
-        if self.directory:
-            path = Path(value).expanduser().resolve()
-            if not path.is_dir():
-                raise Failure(f"--{self.name}: {value} is not a directory")
-            return str(path)
-        if self.file:
-            path = Path(value).expanduser().resolve()
-            if not path.is_file():
-                raise Failure(f"--{self.name}: {value} is not a file")
+        if self.directory or self.file:
+            path = Path(value).expanduser().absolute()
+            try:
+                with root_input(path, directory=self.directory):
+                    pass
+            except Failure as error:
+                raise Failure(f"--{self.name}: {error}") from error
             return str(path)
         if self.pattern and not re.fullmatch(self.pattern, value):
             raise Failure(f"--{self.name}: {value!r} is not {self.help}")
@@ -93,6 +93,7 @@ class Look:
     installed: bool
     irregular: list[str] = field(default_factory=list)  # stop: nothing changes
     notes: list[str] = field(default_factory=list)      # understood: reported, nothing to do
+    retained: bool = False  # recognized leftovers that uninstall --delete-data can finish
 
 
 def settings_of(install_steps: Any, release: Release) -> list[Setting]:
@@ -114,7 +115,8 @@ def _instance(ctx: Context, install_steps: Any, args: argparse.Namespace) -> Non
 
 def add_options(parser: argparse.ArgumentParser, install_steps: Any, release: Release) -> None:
     _instance_option(parser, install_steps)
-    group = parser.add_argument_group("first install (only when nothing is installed yet)")
+    scope = "the named instance" if getattr(install_steps, "INSTANCE", None) is not None else "this component"
+    group = parser.add_argument_group(f"first install (only when {scope} is not installed)")
     group.add_argument("--install", action="store_true",
                        help="install without asking (needed without a terminal)")
     for setting in settings_of(install_steps, release):
@@ -343,7 +345,8 @@ def uninstall_main(directory: str | Path, install_steps: Any, argv: list[str] | 
     parser.add_argument("home", nargs="?", help=f"default: {release.default_home}, or {_homes_file()}")
     _instance_option(parser, install_steps)
     parser.add_argument("--delete-data", action="store_true",
-                        help="also remove the account, once what it owned is sealed (root's, 0700); state and configuration are never deleted")
+                        help=getattr(install_steps, "DELETE_DATA_HELP",
+                                     "also remove the account, once what it owned is sealed (root's, 0700); state and configuration are never deleted"))
     parser.add_argument("--yes", action="store_true", help="do not ask (needed without a terminal)")
     args = parser.parse_args(argv)
     home = Path(os.path.abspath(args.home or homes().get(release.component, release.default_home)))
@@ -351,6 +354,7 @@ def uninstall_main(directory: str | Path, install_steps: Any, argv: list[str] | 
     try:
         if os.geteuid() != 0 and not os.environ.get("BORING_DEPLOY_TEST"):
             raise Failure("run as root (sudo)")
+        sys.modules[_engine].check_home_path(home, missing_ok=True)
         with operation_lock(home):  # before look; held to the record and homes.json
             return _uninstall(ctx, install_steps, args)
     except (Failure, OSError, subprocess.SubprocessError, KeyError, ValueError) as problem:
@@ -371,13 +375,14 @@ def _uninstall(ctx: Context, install_steps: Any, args: argparse.Namespace) -> in
     print(f"1 look  {what} in {home}", flush=True)
     look = install_steps.look(ctx)
     report(ctx, look)
-    if not look.installed:
+    if not look.installed and not (args.delete_data and look.retained):
         print("not installed here: nothing to do")
         return 0
     if not args.yes:
         if not _terminal():
             raise Failure("asks first", "pass --yes (no terminal to ask)")
-        data = " and its account" if args.delete_data else ""
+        data = ((" (" + install_steps.DELETE_DATA_HELP + ")")
+                if hasattr(install_steps, "DELETE_DATA_HELP") else " and its account") if args.delete_data else ""
         if input(f"Uninstall {what}{data} from {home}? [y/N] ").strip().lower() not in ("y", "yes"):
             raise Failure("not uninstalled (declined)")
     print("2 uninstall", flush=True)

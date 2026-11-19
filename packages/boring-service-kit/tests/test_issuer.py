@@ -42,10 +42,9 @@ def configured(tmp_path, **issuer):
     (tmp_path / "approval").write_text(SECRET)
     path = tmp_path / "config.json"
     path.write_text(json.dumps({
-        "url": URL,
+        "url": URL, "mode": "issuer",
         "issuer": {"database": "state/oauth.db", "approval_secret_file": "approval", "subject": "robin",
-                   "name": "Robin", **issuer},
-        "access": [{"subject": "robin", "role": "writer"}]}))
+                   "name": "Robin", "role": "writer", **issuer}}))
     config = ServiceConfig(path)
     fetched = []
 
@@ -338,45 +337,44 @@ def test_dynamic_registration_only_when_enabled(tmp_path):
     run(config, scenario)
 
 
-def test_access_keys_work_beside_the_issuer(tmp_path):
-    keyfile = tmp_path / "keys.json"
-    _, key = keys.add(keyfile, "script@host", "reader", 1, issuer="key:issuer-test")
-    state = tmp_path / "state"
-    state.mkdir(mode=0o700)
-    (tmp_path / "approval").write_text(SECRET)
-    (tmp_path / "config.json").write_text(json.dumps({
-        "url": URL, "keys": {"file": "keys.json"},
-        "issuer": {"database": "state/oauth.db", "approval_secret_file": "approval", "subject": "robin"},
-        "access": [{"subject": "robin", "role": "writer"}]}))
-    config = ServiceConfig(tmp_path / "config.json")
-
-    async def scenario(service):
-        refused, data = await service.result("whoami", {}, key)
-        assert not refused and "script@host" in data["author"]
-        assert (await service.call("whoami", {}, "access_not-a-real-token")).status_code == 401
-    run(config, scenario)
+def test_access_keys_cannot_share_the_own_issuer(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"url": URL, "mode": "issuer", "keys": {"file": "keys.json"},
+                               "issuer": {"role": "writer"}}))
+    with pytest.raises(ValueError, match="exactly one"):
+        ServiceConfig(path)
 
 
 def test_config_rules_for_the_issuer(tmp_path):
-    (tmp_path / "secret").write_text("x")
-    base = {"url": URL, "issuer": {"database": "oauth.db", "approval_secret_file": "secret", "subject": "robin"}}
+    (tmp_path / "secret").write_text(SECRET)
+    base = {"url": URL, "mode": "issuer", "issuer": {"database": "oauth.db",
+            "approval_secret_file": "secret", "subject": "robin", "role": "writer"}}
 
     def load(data):
         (tmp_path / "config.json").write_text(json.dumps(data))
         return ServiceConfig(tmp_path / "config.json")
-    with pytest.raises(ValueError, match="listed in access"):
+    with pytest.raises(ValueError, match="role"):
+        load({**base, "issuer": {**base["issuer"], "role": "administrator"}})
+    with pytest.raises(ValueError, match="replaced"):
         load({**base, "access": []})
-    with pytest.raises(ValueError, match="exclude each other"):
-        load({**base, "oauth": {}, "access": []})
     with pytest.raises(ValueError, match="issuer supports"):
-        load({**base, "issuer": {**base["issuer"], "registration": True}, "access": []})
-    # Every Pond call carries the Crocodile's token, which an issuer of its own would refuse: refused
-    # before any file is read (the pond secret need not exist); a null pond is no registration
-    access = [{"subject": "robin", "role": "writer"}]
-    pond = {"url": "https://pond.example", "client_id": "svc", "secret_file": "missing"}
-    with pytest.raises(ValueError, match="issuer and pond exclude each other"):
-        load({**base, "access": access, "pond": pond})
-    assert load({**base, "access": access, "pond": None}).watchdog is None
+        load({**base, "issuer": {**base["issuer"], "registration": True}})
+    with pytest.raises(ValueError, match="crocodile"):
+        load({**base, "pond": None})
+    assert load(base).watchdog is None
+
+
+def test_issuer_refuses_short_secret_at_startup_and_after_rotation(tmp_path):
+    config = configured(tmp_path)
+    secret = tmp_path / "approval"
+    secret.write_text("x" * 23 + "\n")
+    with pytest.raises(ValueError, match="at least 24 characters"):
+        ServiceConfig(tmp_path / "config.json")
+
+    async def scenario(service):
+        _, response, _ = await sign_in(service, secret="x" * 23)
+        assert response.status_code == 503 and "Approval is unavailable" in response.text
+    run(config, scenario)
 
 
 def test_remove_and_prune(tmp_path):
@@ -481,9 +479,8 @@ def test_issuer_under_a_path_behind_a_path_keeping_proxy(tmp_path):
     (tmp_path / "state").mkdir(mode=0o700)
     (tmp_path / "approval").write_text(SECRET)
     (tmp_path / "config.json").write_text(json.dumps({
-        "url": url, "issuer": {"url": "http://127.0.0.1:18599/services/lone", "database": "state/oauth.db",
-                               "approval_secret_file": "approval", "subject": "robin"},
-        "access": [{"subject": "robin", "role": "writer"}]}))
+        "url": url, "mode": "issuer", "issuer": {"url": "http://127.0.0.1:18599/services/lone", "database": "state/oauth.db",
+                               "approval_secret_file": "approval", "subject": "robin", "role": "writer"}}))
     config = ServiceConfig(tmp_path / "config.json")
     config.issuer.fetch = lambda client_id: metadata_document(client_id, CALLBACK)
     assert config.issuer_paths[0] == "/services/lone/authorize"
